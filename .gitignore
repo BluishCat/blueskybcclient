@@ -1,0 +1,17 @@
+/.continue
+/.venv
+/.vs
+/.vscode
+/crash_log.txt
+/dist
+/error.txt
+/sound
+/tests
+/test_align.py
+/test_bold.py
+/test_timeline_extract.py
+/test_tk.py
+/test_treeview_event.py
+/tmp
+/ui_main_window_settings_methods.py.tmp
+/__pycache__
