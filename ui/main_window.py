@@ -13,6 +13,7 @@ import webbrowser
 import queue
 import os
 import uuid
+from collections import OrderedDict
 import windnd
 from PIL import Image as PILImage, ImageTk as PILImageTk, ImageGrab
 from utils.ui_config import save_ui_state, load_ui_state
@@ -384,9 +385,10 @@ class MainWindow:
         self._avatar_workers_started = False
         self._prefetch_queue = queue.Queue()
         self._prefetch_workers_started = False
-        self._image_cache = {}  # url -> bytes (共有URLキャッシュ)
+        self._image_cache = OrderedDict()  # url -> bytes (共有URLキャッシュ, LRU)
         self._image_cache_max = 500  # キャッシュ上限エントリ数
         self._loaded_tabs = set() # tab_keys that have been refreshed at least once
+        self._tree_items = {} # tab_key -> tuple(item_id): 直近描画時の行ID一覧（get_children 呼び出し削減用）
         
         # Load font settings
         self.font_family = self.ui_settings.get("font_family", "sans-serif")
@@ -451,6 +453,34 @@ class MainWindow:
                     from tkinter import messagebox as _mb
                     _mb.showerror("ログインエラー", f"ログインに失敗しました：{error_msg}", parent=window.window)
 
+    def _cache_get(self, url):
+        """画像キャッシュ参照。ヒット時はLRU順を更新して bytes を返す。未ヒットは None。"""
+        data = self._image_cache.get(url)
+        if data is not None:
+            self._image_cache.move_to_end(url)
+        return data
+
+    def _cache_put(self, url, data):
+        """画像キャッシュ格納。上限超過時は最古(LRU)エントリを破棄し、常に直近分を保持する。"""
+        self._image_cache[url] = data
+        self._image_cache.move_to_end(url)
+        while len(self._image_cache) > self._image_cache_max:
+            self._image_cache.popitem(last=False)
+
+    def _refresh_tree_items(self, window, tab_key):
+        """タブの行ID一覧をキャッシュし直す。テーブル再描画（値差し替え）直後に呼ぶ。"""
+        elem = window[f"-TIMELINE_{tab_key}-"]
+        if elem and elem.widget:
+            self._tree_items[tab_key] = elem.widget.get_children()
+
+    def _get_tree_items(self, tree, tab_key):
+        """キャッシュ済みの行ID一覧を返す。未キャッシュ時のみ get_children() で取得して格納する。"""
+        items = self._tree_items.get(tab_key)
+        if items is None:
+            items = tree.get_children()
+            self._tree_items[tab_key] = items
+        return items
+
     def _display_image(self, window, data):
         """Helper to display image data smoothly on the -IMAGE- element."""
         if not data:
@@ -484,7 +514,8 @@ class MainWindow:
             post.is_read = True
             if hasattr(self, "_app_ref") and self._app_ref:
                 self._app_ref.read_post_uris.add(post.uri)
-            self.apply_unread_tags(window, tabs)
+            # 選択で既読になるのは表示中タブの1投稿のみ。全タブ再走査は不要なので対象タブだけ更新する。
+            self.apply_unread_tags(window, tabs, target_tab=tab)
             
             # Update detail view elements
             window["-DETAIL_AUTHOR-"].update(post.author_display_name)
@@ -562,16 +593,16 @@ class MainWindow:
             avatar_elem = window["-AUTHOR_AVATAR-"]
             if post.avatar_url:
                 avatar_elem.erase()
-                if post.avatar_url in self._image_cache:
+                cached = self._cache_get(post.avatar_url)
+                if cached is not None:
                     # キャッシュヒット：即座にイベントを発行
-                    window.events.put(("-AVATAR_DOWNLOAD_COMPLETE-", {"data": self._image_cache[post.avatar_url]}))
+                    window.events.put(("-AVATAR_DOWNLOAD_COMPLETE-", {"data": cached}))
                 else:
                     def download_avatar_thread(url, win):
                         try:
                             resp = requests.get(url, timeout=10)
                             if resp.status_code == 200:
-                                if len(self._image_cache) < self._image_cache_max:
-                                    self._image_cache[url] = resp.content
+                                self._cache_put(url, resp.content)
                                 win.events.put(("-AVATAR_DOWNLOAD_COMPLETE-", {"data": resp.content}))
                         except Exception:
                             pass
@@ -602,17 +633,17 @@ class MainWindow:
                     except Exception: pass
                 
                 thumb_url = post.thumbnail_urls[0]
-                if thumb_url in self._image_cache:
+                cached = self._cache_get(thumb_url)
+                if cached is not None:
                     # キャッシュヒット：即座に描画
-                    self._display_image(window, self._image_cache[thumb_url])
+                    self._display_image(window, cached)
                 else:
                     # 新しい画像を読み込む間も古い画像を残すため、ここでは erase() しない
                     def download_thumb_thread(url, win):
                         try:
                             resp = requests.get(url, timeout=10)
                             if resp.status_code == 200:
-                                if len(self._image_cache) < self._image_cache_max:
-                                    self._image_cache[url] = resp.content
+                                self._cache_put(url, resp.content)
                                 win.events.put(("-THUMB_DOWNLOAD_COMPLETE-", {"data": resp.content}))
                                 try: win.window.quit()
                                 except Exception: pass
@@ -632,30 +663,34 @@ class MainWindow:
         display_text = post.text.replace("\n", " ") if post.text else ""
         return [post.author_display_name, reply_str, display_text, post.created_at, post.repost_count, post.like_count]
 
-    def apply_unread_tags(self, window: eg.Window, tabs: list): # Changed type hint from List[TabModel] to list to avoid import issues
+    def apply_unread_tags(self, window: eg.Window, tabs, target_tab=None): # Changed type hint from List[TabModel] to list to avoid import issues
+        # target_tab 指定時はそのタブだけ処理する（投稿クリック時など、1タブしか状態が変わらないケース向け）。
+        # tabs は list でも単一 tab でも受け付ける。
+        if target_tab is not None:
+            tabs = [target_tab]
+        elif not isinstance(tabs, (list, tuple)):
+            tabs = [tabs]
         for tab in tabs:
             elem = window[f"-TIMELINE_{tab.tab_key}-"]
             if elem:
                 # Get the underlying treeview widget
                 tree: ttk.Treeview = elem.widget
-                # Clear existing tags first
-                for child in tree.get_children():
-                    tree.item(child, tags=())
+                # item-id は一度だけ取得する（旧実装は投稿数ぶん get_children() を呼び O(n²) だった）
+                items = tree.get_children()
 
-                for idx, post in enumerate(tab.posts):
-                    tags = []
-                    tags.append("unread" if not post.is_read else "read")
+                for idx, item_id in enumerate(items):
+                    if idx >= len(tab.posts):
+                        # 投稿に対応しない余剰行はタグをクリアするだけ
+                        tree.item(item_id, tags=())
+                        continue
+                    post = tab.posts[idx]
+                    tags = ["unread" if not post.is_read else "read"]
                     if hasattr(post, 'is_repost') and post.is_repost:
                         tags.append("repost")
                     if hasattr(post, 'is_follower') and post.is_follower:
                         tags.append("follower")
-                        
-                    # Get the correct item ID from the treeview
-                    items = tree.get_children()
-                    if idx < len(items):
-                        item_id = items[idx]
-                        tree.item(item_id, tags=tuple(tags))
-                
+                    tree.item(item_id, tags=tuple(tags))
+
                 # Configure tags (only need to do this once per widget, but here is fine)
                 tree.tag_configure("unread", font=(self.font_family, self.font_size, "bold"))
                 tree.tag_configure("read", font=(self.font_family, self.font_size, "normal"))
@@ -1333,15 +1368,13 @@ class MainWindow:
                     if task is None: break
                     url, tab_key, row_idx, win = task
                     try:
-                        if url in self._image_cache:
-                            # キャッシュヒット：HTTPリクエスト不要
-                            data = self._image_cache[url]
-                        else:
+                        data = self._cache_get(url)
+                        if data is None:
+                            # キャッシュミス：ダウンロードして格納
                             resp = requests.get(url, timeout=10)
                             if resp.status_code == 200:
                                 data = resp.content
-                                if len(self._image_cache) < self._image_cache_max:
-                                    self._image_cache[url] = data
+                                self._cache_put(url, data)
                             else:
                                 data = None
                         if data:
@@ -1358,11 +1391,10 @@ class MainWindow:
                     url = self._prefetch_queue.get()
                     if url is None: break
                     try:
-                        if url not in self._image_cache:
+                        if self._cache_get(url) is None:
                             resp = requests.get(url, timeout=10)
                             if resp.status_code == 200:
-                                if len(self._image_cache) < self._image_cache_max:
-                                    self._image_cache[url] = resp.content
+                                self._cache_put(url, resp.content)
                     except Exception: pass
                     self._prefetch_queue.task_done()
             for _ in range(4):
@@ -1381,10 +1413,11 @@ class MainWindow:
             for t_model in tab_models:
                 for r_idx, p in enumerate(t_model.posts):
                     if p.avatar_url:
-                        if p.avatar_url in self._image_cache:
+                        cached = self._cache_get(p.avatar_url)
+                        if cached is not None:
                             # キャッシュヒット：ワーカー経由せず即イベント発行
                             win.events.put(("-LIST_AVATAR_DOWNLOAD_COMPLETE-", {
-                                "data": self._image_cache[p.avatar_url],
+                                "data": cached,
                                 "tab_key": t_model.tab_key,
                                 "row_idx": r_idx
                             }))
@@ -1392,7 +1425,7 @@ class MainWindow:
                             self._avatar_queue.put((p.avatar_url, t_model.tab_key, r_idx, win))
                     if getattr(p, "thumbnail_urls", None):
                         for thumb_url in p.thumbnail_urls:
-                            if thumb_url not in self._image_cache:
+                            if self._cache_get(thumb_url) is None:
                                 self._prefetch_queue.put(thumb_url)
                         
         self._start_avatar_downloads = _queue_avatars
@@ -1615,7 +1648,7 @@ class MainWindow:
                         table_elem = window[f"-TIMELINE_{tab_key}-"]
                         if table_elem:
                             tree = table_elem.widget
-                            items = tree.get_children()
+                            items = self._get_tree_items(tree, tab_key)
                             if row_idx < len(items):
                                 item_id = items[row_idx]
                                 tree.item(item_id, image=photo)
@@ -1641,15 +1674,15 @@ class MainWindow:
                     idx_text = f"{new_idx + 1} / {n}"
                     window["-IMAGE_INDEX-"].update(idx_text)
                     url = self.current_selected_post.thumbnail_urls[new_idx]
-                    if url in self._image_cache:
-                        self._display_image(window, self._image_cache[url])
+                    cached = self._cache_get(url)
+                    if cached is not None:
+                        self._display_image(window, cached)
                     else:
                         def _dl_cycle(u=url, win=window):
                             try:
                                 resp = requests.get(u, timeout=10)
                                 if resp.status_code == 200:
-                                    if len(self._image_cache) < self._image_cache_max:
-                                        self._image_cache[u] = resp.content
+                                    self._cache_put(u, resp.content)
                                     win.events.put(("-THUMB_DOWNLOAD_COMPLETE-", {"data": resp.content}))
                                     try: win.window.quit()
                                     except Exception: pass
@@ -1667,8 +1700,8 @@ class MainWindow:
                 if key in ("space", " ", "　", "??"):
                     import time
                     current_time = time.time()
-                    # 閾値を 0.2s に短縮（ユーザー要望、チャタリング防止）
-                    if hasattr(self, '_last_space_time') and current_time - self._last_space_time < 0.2:
+                    # 閾値を 0.1s に短縮（ユーザー要望、連打時の追従を速く / 長押しのチャタリングは抑止）
+                    if hasattr(self, '_last_space_time') and current_time - self._last_space_time < 0.1:
                         continue
 
                     # If the user is typing in a text field, ignore the shortcut UNLESS the field is empty
@@ -1822,6 +1855,8 @@ class MainWindow:
                     table_elem = window[f"-TIMELINE_{tab.tab_key}-"]
                     if table_elem:
                         table_elem.update(values=[["（読み込み中…）", "", "投稿を取得しています…", "", 0, 0]])
+                        # 行が差し替わったので行IDキャッシュも更新
+                        self._refresh_tree_items(window, tab.tab_key)
                 
                 def _do_refresh(win, tk=target_tab_key):
                     try:
@@ -1857,7 +1892,9 @@ class MainWindow:
                     table_elem = window[f"-TIMELINE_{tab_model.tab_key}-"]
                     if table_elem:
                         table_elem.update(values=list_items)
-                        
+                        # 新しい行IDをキャッシュ（アバター反映時の get_children 反復を回避）
+                        self._refresh_tree_items(window, tab_model.tab_key)
+
                 self.apply_unread_tags(window, updated_tabs)
                 self._start_avatar_downloads(window, tabs_to_update)
             elif event == "-ACTION_REPOST-":
