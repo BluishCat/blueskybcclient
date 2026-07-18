@@ -24,11 +24,9 @@ def format_bluesky_date(date_str):
         # Convert to local timezone
         local_dt = dt.astimezone()
         return local_dt.strftime("%Y/%m/%d %H:%M:%S")
-    except Exception as e:
-        print(f"Date parse error for '{date_str}': {e}")
+    except Exception:
+        # パース不能な日時はそのまま返す
         return date_str
-
-_debug_count = 0
 
 class Post:
     def __init__(self, author_handle, author_display_name, text, created_at, uri=None, cid=None, reply_to=None, thumbnail_urls=None, full_image_urls=None, repost_count=0, like_count=0, avatar_url=None, reply_parent_author=None, reply_parent_handle=None, reply_parent_text=None, quote_author=None, quote_handle=None, quote_text=None, is_repost=False, reposted_by_author=None, reposted_by_handle=None, is_follower=False):
@@ -157,11 +155,6 @@ class Post:
                         full_image_urls.append(post.embed.external.uri)
                 
         avatar_url = getattr(author, 'avatar', None)
-        # Debug: print first 5
-        global _debug_count
-        if _debug_count < 5:
-            print(f"Author: {author.handle}, avatar: {avatar_url}")
-            _debug_count += 1
         return cls(
             author_handle=author.handle,
             author_display_name=author.display_name,
