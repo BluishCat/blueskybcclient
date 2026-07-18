@@ -507,7 +507,9 @@ class MainWindow:
         except Exception:
             pass
 
-    def _update_detail_view(self, window, tab, row_idx, tabs):
+    def _update_detail_view(self, window, tab, row_idx, tabs, skip_image_load=False):
+        # skip_image_load: 未読ジャンプ長押しで通過中の投稿。ネットワーク画像DLを省き応答性を優先する
+        #（キャッシュ済みは即時描画するので流用する）。
         if row_idx < len(tab.posts):
             post = tab.posts[row_idx]
             self.current_selected_post = post
@@ -597,7 +599,7 @@ class MainWindow:
                 if cached is not None:
                     # キャッシュヒット：即座にイベントを発行
                     window.events.put(("-AVATAR_DOWNLOAD_COMPLETE-", {"data": cached}))
-                else:
+                elif not skip_image_load:
                     def download_avatar_thread(url, win):
                         try:
                             resp = requests.get(url, timeout=10)
@@ -637,7 +639,7 @@ class MainWindow:
                 if cached is not None:
                     # キャッシュヒット：即座に描画
                     self._display_image(window, cached)
-                else:
+                elif not skip_image_load:
                     # 新しい画像を読み込む間も古い画像を残すため、ここでは erase() しない
                     def download_thumb_thread(url, win):
                         try:
@@ -1704,6 +1706,9 @@ class MainWindow:
                     if hasattr(self, '_last_space_time') and current_time - self._last_space_time < 0.1:
                         continue
 
+                    # 長押し（オートリピート）判定: 直前の処理から間もなければ長押しで通過中とみなす
+                    is_key_held = current_time - getattr(self, '_last_space_time', 0.0) < 0.3
+
                     # If the user is typing in a text field, ignore the shortcut UNLESS the field is empty
                     focused = window.window.focus_get()
                     import tkinter as _tk
@@ -1837,8 +1842,11 @@ class MainWindow:
                                     item_id = items[target_unread_idx]
                                     tree.selection_set(item_id)
                                     tree.see(item_id)
+                                    # 長押しで通過中かつ他に未読が残る場合は画像DLをスキップして応答性を優先
+                                    total_unread = sum(1 for t in tabs for p in t.posts if not p.is_read)
+                                    skip_image_load = is_key_held and total_unread > 1
                                     # Update detail view manually
-                                    self._update_detail_view(window, target_tab, target_unread_idx, tabs)
+                                    self._update_detail_view(window, target_tab, target_unread_idx, tabs, skip_image_load=skip_image_load)
                     
                     # 処理完了後に時刻を更新（ラグによる二重実行防止）
                     import time
