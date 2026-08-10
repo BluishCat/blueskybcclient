@@ -19,16 +19,16 @@ from PIL import Image as PILImage, ImageTk as PILImageTk, ImageGrab
 from utils.ui_config import save_ui_state, load_ui_state
 from utils.paths import get_resource_path
 
-# 未読ジャンプのスロットル。長押しのチャタリングとキューの積み残しを抑えつつ、
-# キーリピート間隔(最速 約32ms)を無駄に待たない値。実際の送り間隔は
-# 「1投稿の処理時間 + この値をリピート間隔で切り上げた分」になる。
-SPACE_JUMP_THROTTLE_SEC = 0.05
-# 未読ジャンプ長押しの判定窓。Windowsのキーリピート開始遅延（既定 約500ms）を跨いでも
-# 「通過中」と見なせるよう余裕を持たせる。
-SPACE_HOLD_WINDOW_SEC = 0.8
-# 長押しが途切れてから詳細ペインの画像を読み込むまでの待ち。
-# ジャンプのスロットル(0.1s)より十分長く、通過中に誤発火しない値。
+# 未読ジャンプ長押しの送り間隔。KeyPress/KeyRelease で押下状態を直接見て
+# after() で送るため、OSのキーリピート速度にもイベントキューの往復にも縛られない。
+SPACE_REPEAT_INTERVAL_MS = 40
+# 長押しと単押しを分ける待ち。これを超えて押され続けたときだけ連続送りに入る。
+SPACE_REPEAT_DELAY_MS = 300
+# 詳細ペインの画像を読み込むまでの待ち。通常はキーを離した時点で即読み込むので、
+# フォーカス喪失などで KeyRelease を取りこぼした場合の保険として働く。
 DETAIL_IMAGE_SETTLE_MS = 250
+# Windows Tkinter は全角スペースやIME経由のキーに '??' を返すことがある。
+SPACE_KEYSYMS = ("space", " ", "　", "??")
 
 # --- TkEasyGUI compatibility fix for version 1.0.40 ---
 # TkEasyGUI's _widget_update() stores all kwargs (including `visible`) into
@@ -399,6 +399,8 @@ class MainWindow:
         self._image_cache = OrderedDict()  # url -> bytes (共有URLキャッシュ, LRU)
         self._image_cache_max = 500  # キャッシュ上限エントリ数
         self._detail_image_timer = None  # 長押し通過後に画像を読み込む after() のID
+        self._space_held = False  # スペースが物理的に押されているか（KeyPress/KeyReleaseで更新）
+        self._space_repeat_timer = None  # 長押し中の連続ジャンプ after() のID
         self._loaded_tabs = set() # tab_keys that have been refreshed at least once
         self._tree_items = {} # tab_key -> tuple(item_id): 直近描画時の行ID一覧（get_children 呼び出し削減用）
         
@@ -699,6 +701,164 @@ class MainWindow:
         if self._detail_image_timer:
             window.window.after_cancel(self._detail_image_timer)
             self._detail_image_timer = None
+
+    def _is_space_input_blocked(self, window):
+        """入力欄で文字を打っている最中ならジャンプを無視する。
+        空欄なら（IMEが残した空白を消したうえで）ジャンプを通す。"""
+        focused = window.window.focus_get()
+        if not isinstance(focused, (tk.Entry, ttk.Entry, tk.Text)):
+            return False
+        if isinstance(focused, tk.Text):
+            if focused.get("1.0", "end-1c").strip() != "":
+                return True
+            focused.delete("1.0", "end")
+        else:
+            if focused.get().strip() != "":
+                return True
+            focused.delete(0, "end")
+        return False
+
+    def _on_space_press(self, window, tabs):
+        """スペース押下。単押しぶんを即座に送り、押し続けられたら連続送りに入る。
+        オートリピートのKeyPressは押下状態で弾くので、送り速度はタイマーだけが決める。"""
+        if self._space_held:
+            return
+        if self._is_space_input_blocked(window):
+            return
+        self._space_held = True
+        # 単押しはここで完結するので画像も即座に読み込む
+        self._jump_to_next_unread(window, tabs, skip_image_load=False)
+        self._space_repeat_timer = window.window.after(
+            SPACE_REPEAT_DELAY_MS, lambda: self._space_repeat_tick(window, tabs)
+        )
+
+    def _space_repeat_tick(self, window, tabs):
+        """長押し中の1送り。通過中は画像処理を省き、押されている間だけ自分を張り直す。"""
+        if not self._space_held:
+            self._space_repeat_timer = None
+            return
+        self._jump_to_next_unread(window, tabs, skip_image_load=True)
+        self._space_repeat_timer = window.window.after(
+            SPACE_REPEAT_INTERVAL_MS, lambda: self._space_repeat_tick(window, tabs)
+        )
+
+    def _on_space_release(self, window):
+        """スペース解放。連続送りを即座に止め、通過中にスキップした画像を読み込む。"""
+        self._space_held = False
+        if self._space_repeat_timer:
+            window.window.after_cancel(self._space_repeat_timer)
+            self._space_repeat_timer = None
+        # 保留中＝直前の送りが画像をスキップしている。settleを待たずここで読み込む
+        if self._detail_image_timer:
+            self._cancel_detail_image_load(window)
+            self._load_detail_images(window, self.current_selected_post)
+
+    def _jump_to_next_unread(self, window, tabs, skip_image_load):
+        """現在タブを優先して最も古い未読へ移動する。未読が尽きたらホームタブ先頭へ戻る。"""
+        tab_group_elem = window["-TABGROUP-"]
+        if not tab_group_elem:
+            return
+
+        # Find which tab is visually selected
+        current_tab_id = tab_group_elem.widget.select()
+        current_tab_v_idx = tab_group_elem.widget.index(current_tab_id)
+
+        # Notebook.tabs() matches tabs in visual order
+        v_tabs = tab_group_elem.widget.tabs()
+        target_tab = None
+        target_unread_idx = -1
+
+        # Search starting from current visual index
+        for i in range(len(tabs)):
+            v_idx = (current_tab_v_idx + i) % len(tabs)
+            v_tab_id = v_tabs[v_idx]
+            # Find matching model by looking at its Tab widget id
+            matching_tab_model = None
+            for t_model in tabs:
+                tab_elem = window[f"-TAB_{t_model.tab_key}-"]
+                if tab_elem and str(tab_elem.widget) == v_tab_id:
+                    matching_tab_model = t_model
+                    break
+
+            if not matching_tab_model:
+                continue
+
+            # Find currently selected row if in this tab
+            start_idx = 0
+            table_elem = window[f"-TIMELINE_{matching_tab_model.tab_key}-"]
+            if table_elem:
+                tree: ttk.Treeview = table_elem.widget
+                sel = tree.selection()
+                if sel:
+                    items = tree.get_children()
+                    try:
+                        start_idx = items.index(sel[0]) + 1
+                    except ValueError:
+                        pass
+
+            # 表示は index 0 が最新なので、選択行より上（＝古い方から新しい方）へ遡る
+            sel_idx = start_idx - 1 if start_idx > 0 else len(matching_tab_model.posts)
+            found_in_tab = -1
+
+            for p_idx in range(sel_idx - 1, -1, -1):
+                if not matching_tab_model.posts[p_idx].is_read:
+                    found_in_tab = p_idx
+                    break
+
+            # If not found, wrap around to the bottom
+            if found_in_tab == -1:
+                for p_idx in range(len(matching_tab_model.posts) - 1, sel_idx, -1):
+                    if not matching_tab_model.posts[p_idx].is_read:
+                        found_in_tab = p_idx
+                        break
+
+            if found_in_tab != -1:
+                target_tab = matching_tab_model
+                target_unread_idx = found_in_tab
+                break
+
+        # target_tab が None のまま（全タブ未読なし）の場合
+        # 現在ホームタブの先頭ポストを見ていない場合はそこへジャンプ
+        if not target_tab and tabs:
+            home_tab = tabs[0]  # ホームタブ＝最初のタブ
+            home_table_elem = window[f"-TIMELINE_{home_tab.tab_key}-"]
+            if home_table_elem and home_tab.posts:
+                home_tree: ttk.Treeview = home_table_elem.widget
+                home_items = home_tree.get_children()
+                if home_items:
+                    # 現在選択中のビジュアルタブがホームかどうか
+                    home_tab_elem = window[f"-TAB_{home_tab.tab_key}-"]
+                    current_tab_widget = str(tab_group_elem.widget.select())
+                    home_tab_widget = str(home_tab_elem.widget) if home_tab_elem else ""
+                    is_on_home_tab = (current_tab_widget == home_tab_widget)
+
+                    # ホームタブの選択行
+                    currently_selected = home_tree.selection()
+                    is_on_first_row = (currently_selected and currently_selected[0] == home_items[0])
+
+                    # 別タブにいる OR ホームタブだが先頭が選択されていない → 飛ぶ
+                    if not is_on_home_tab or not is_on_first_row:
+                        target_tab = home_tab
+                        target_unread_idx = 0
+                        tab_group_elem.widget.select(home_tab_elem.widget)
+
+        if not target_tab:
+            return
+
+        # Switch to this tab visually
+        target_tab_elem = window[f"-TAB_{target_tab.tab_key}-"]
+        tab_group_elem.widget.select(target_tab_elem.widget)
+
+        # Select this row in the corresponding table
+        table_elem = window[f"-TIMELINE_{target_tab.tab_key}-"]
+        if table_elem:
+            tree: ttk.Treeview = table_elem.widget
+            items = tree.get_children()
+            if target_unread_idx < len(items):
+                item_id = items[target_unread_idx]
+                tree.selection_set(item_id)
+                tree.see(item_id)
+                self._update_detail_view(window, target_tab, target_unread_idx, tabs, skip_image_load=skip_image_load)
 
     def format_post_for_list(self, post):
         # Return a row for the table: [Name, Reply To, Text, Date, RT, Like]
@@ -1212,6 +1372,20 @@ class MainWindow:
             self._resize_timer = window.window.after(300, lambda: window.dispatch_event("-REDRAW_PREVIEW_IMAGE-", {}))
         
         window["-IMAGE-"].widget.bind("<Configure>", _on_image_configure)
+
+        # 未読ジャンプはイベントキュー経由(-WINDOW_KEY_EVENT-)ではなく押下状態を直接見る。
+        # read() が1イベントごとに update()+mainloop() を回すため、キュー経由だとオートリピートが
+        # 溜まって送りが遅く、キーを離した後も積み残しが処理されて行き過ぎていた。
+        def _on_space_key_press(e):
+            if e.keysym in SPACE_KEYSYMS or e.char in (" ", "　"):
+                self._on_space_press(window, tabs)
+
+        def _on_space_key_release(e):
+            if e.keysym in SPACE_KEYSYMS or e.char in (" ", "　"):
+                self._on_space_release(window)
+
+        window.window.bind("<KeyPress>", _on_space_key_press, add="+")
+        window.window.bind("<KeyRelease>", _on_space_key_release, add="+")
 
         # Bind double-click, right-click and column-reorder events
         self._column_reorderers = {}  # tab_key -> ColumnReorderer
@@ -1734,162 +1908,10 @@ class MainWindow:
                                 pass
                         threading.Thread(target=_dl_cycle, daemon=True).start()
             elif event == "-WINDOW_KEY_EVENT-":
-                key = values.get("key")
-                
-                if key == "F5":
+                # スペース（未読ジャンプ）は KeyPress/KeyRelease バインドで直接処理する
+                if values.get("key") == "F5":
                     window.dispatch_event("Refresh")
                     continue
-
-                # '??' is emitted by Windows Tkinter for Zenkaku Space and other unmapped IME keys.
-                if key in ("space", " ", "　", "??"):
-                    import time
-                    current_time = time.time()
-                    if hasattr(self, '_last_space_time') and current_time - self._last_space_time < SPACE_JUMP_THROTTLE_SEC:
-                        continue
-
-                    # 長押し（オートリピート）判定: 直前の処理から間もなければ長押しで通過中とみなす
-                    is_key_held = current_time - getattr(self, '_last_space_time', 0.0) < SPACE_HOLD_WINDOW_SEC
-
-                    # If the user is typing in a text field, ignore the shortcut UNLESS the field is empty
-                    focused = window.window.focus_get()
-                    import tkinter as _tk
-                    from tkinter import ttk as _ttk
-                    if isinstance(focused, (_tk.Entry, _ttk.Entry, _tk.Text)):
-                        is_empty = False
-                        if isinstance(focused, _tk.Text):
-                            val = focused.get("1.0", "end-1c")
-                            if val.strip() == "":
-                                is_empty = True
-                                focused.delete("1.0", "end")
-                        else:
-                            val = focused.get()
-                            if val.strip() == "":
-                                is_empty = True
-                                focused.delete(0, "end")
-                        
-                        if not is_empty:
-                            continue
-
-                    # Spacebar navigation: find oldest unread, prioritizing the current tab
-                    tab_group_elem = window["-TABGROUP-"]
-                    if tab_group_elem:
-                        # Find which tab is visually selected
-                        current_tab_id = tab_group_elem.widget.select()
-                        # Find the model that matches this visual tab
-                        current_tab = None
-                        current_tab_v_idx = tab_group_elem.widget.index(current_tab_id)
-                        
-                        # Notebook.tabs() matches tabs in visual order
-                        v_tabs = tab_group_elem.widget.tabs()
-                        target_tab = None
-                        target_unread_idx = -1
-                        
-                        # Search starting from current visual index
-                        for i in range(len(tabs)):
-                            v_idx = (current_tab_v_idx + i) % len(tabs)
-                            v_tab_id = v_tabs[v_idx]
-                            # Find matching model by looking at its Tab widget id
-                            matching_tab_model = None
-                            for t_model in tabs:
-                                tab_elem = window[f"-TAB_{t_model.tab_key}-"]
-                                if tab_elem and str(tab_elem.widget) == v_tab_id:
-                                    matching_tab_model = t_model
-                                    break
-                            
-                            if not matching_tab_model:
-                                continue
-                                
-                            # Find currently selected row if in this tab
-                            start_idx = 0
-                            table_elem = window[f"-TIMELINE_{matching_tab_model.tab_key}-"]
-                            if table_elem:
-                                tree: ttk.Treeview = table_elem.widget
-                                sel = tree.selection()
-                                if sel:
-                                    items = tree.get_children()
-                                    try:
-                                        start_idx = items.index(sel[0]) + 1
-                                    except ValueError:
-                                        pass
-
-                            # Search from start_idx - 1 upwards to youngest (index 0)
-                            found_in_tab = -1
-                            # Actually, we want to go from start_idx-1 down to 0
-                            # But wait, start_idx is the index of the element *below* the selected one.
-                            # If we want to find the next oldest, and index 0 is newest, index N is oldest.
-                            # "古い方からでなく新しい方から選択されてしまう" implies spacebar currently selects the NEWEST post first.
-                            # Wait, in the table, index 0 is the NEWEST post (top of the list).
-                            # If we go from start_idx (which is index+1) to len(posts), we are moving to OLDER posts.
-                            # But wait, if they say "古い方からでなく新しい方から" it means the current behavior is selecting NEW (top) -> OLD (bottom).
-                            # They want: OLD (bottom) -> NEW (top).
-                            # Which means moving UP the list (decreasing index).
-                            # So we should search from (start_idx - 2) down to 0. (Since start_idx = selected_idx + 1).
-                            # Let's cleanly define `sel_idx = start_idx - 1`. If no selection, `sel_idx = len(posts)`.
-                            sel_idx = start_idx - 1 if start_idx > 0 else len(matching_tab_model.posts)
-                            
-                            for p_idx in range(sel_idx - 1, -1, -1):
-                                if not matching_tab_model.posts[p_idx].is_read:
-                                    found_in_tab = p_idx
-                                    break
-                            
-                            # If not found, wrap around to the bottom
-                            if found_in_tab == -1:
-                                for p_idx in range(len(matching_tab_model.posts) - 1, sel_idx, -1):
-                                    if not matching_tab_model.posts[p_idx].is_read:
-                                        found_in_tab = p_idx
-                                        break
-                            
-                            if found_in_tab != -1:
-                                target_tab = matching_tab_model
-                                target_unread_idx = found_in_tab
-                                break
-                        
-                        # target_tab が None のまま（全タブ未読なし）の場合
-                        # 現在ホームタブの先頭ポストを見ていない場合はそこへジャンプ
-                        if not target_tab and tabs:
-                            home_tab = tabs[0]  # ホームタブ＝最初のタブ
-                            home_table_elem = window[f"-TIMELINE_{home_tab.tab_key}-"]
-                            if home_table_elem and home_tab.posts:
-                                home_tree: ttk.Treeview = home_table_elem.widget
-                                home_items = home_tree.get_children()
-                                if home_items:
-                                    # 現在選択中のビジュアルタブがホームかどうか
-                                    home_tab_elem = window[f"-TAB_{home_tab.tab_key}-"]
-                                    current_tab_widget = str(tab_group_elem.widget.select())
-                                    home_tab_widget = str(home_tab_elem.widget) if home_tab_elem else ""
-                                    is_on_home_tab = (current_tab_widget == home_tab_widget)
-                                    
-                                    # ホームタブの選択行
-                                    currently_selected = home_tree.selection()
-                                    is_on_first_row = (currently_selected and currently_selected[0] == home_items[0])
-                                    
-                                    # 別タブにいる OR ホームタブだが先頭が選択されていない → 飛ぶ
-                                    if not is_on_home_tab or not is_on_first_row:
-                                        target_tab = home_tab
-                                        target_unread_idx = 0
-                                        tab_group_elem.widget.select(home_tab_elem.widget)
-
-                        if target_tab:
-                            # Switch to this tab visually
-                            target_tab_elem = window[f"-TAB_{target_tab.tab_key}-"]
-                            tab_group_elem.widget.select(target_tab_elem.widget)
-                            
-                            # Select this row in the corresponding table
-                            table_elem = window[f"-TIMELINE_{target_tab.tab_key}-"]
-                            if table_elem:
-                                tree: ttk.Treeview = table_elem.widget
-                                items = tree.get_children()
-                                if target_unread_idx < len(items):
-                                    item_id = items[target_unread_idx]
-                                    tree.selection_set(item_id)
-                                    tree.see(item_id)
-                                    # 長押しで通過中は画像処理をスキップし、キーが途切れてから読み込む
-                                    # Update detail view manually
-                                    self._update_detail_view(window, target_tab, target_unread_idx, tabs, skip_image_load=is_key_held)
-                    
-                    # 処理完了後に時刻を更新（ラグによる二重実行防止）
-                    import time
-                    self._last_space_time = time.time()
             elif event == "Refresh":
                 window.events.put(("-ASYNC_REFRESH_START-", {}))
             elif event == "-ASYNC_REFRESH_START-":
