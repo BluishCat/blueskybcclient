@@ -19,6 +19,19 @@ from PIL import Image as PILImage, ImageTk as PILImageTk, ImageGrab
 from utils.ui_config import save_ui_state, load_ui_state
 from utils.paths import get_resource_path
 
+# 未読ジャンプ長押しの送り間隔。KeyPress/KeyRelease で押下状態を直接見て
+# after() で送るため、OSのキーリピート速度にもイベントキューの往復にも縛られない。
+# 16ms は Tk のタイマー分解能と画面のリフレッシュ(60Hz)から見た実質的な下限。
+# これ以上詰めても描画が追いつかないので、残る速度は1投稿の処理時間で決まる。
+SPACE_REPEAT_INTERVAL_MS = 16
+# 長押しと単押しを分ける待ち。これを超えて押され続けたときだけ連続送りに入る。
+SPACE_REPEAT_DELAY_MS = 300
+# 詳細ペインを本描画するまでの待ち。通常はキーを離した時点で即描画するので、
+# フォーカス喪失などで KeyRelease を取りこぼした場合の保険として働く。
+DETAIL_RENDER_SETTLE_MS = 250
+# Windows Tkinter は全角スペースやIME経由のキーに '??' を返すことがある。
+SPACE_KEYSYMS = ("space", " ", "　", "??")
+
 # --- TkEasyGUI compatibility fix for version 1.0.40 ---
 # TkEasyGUI's _widget_update() stores all kwargs (including `visible`) into
 # self.props. When that element object is later used to create a widget,
@@ -387,6 +400,9 @@ class MainWindow:
         self._prefetch_workers_started = False
         self._image_cache = OrderedDict()  # url -> bytes (共有URLキャッシュ, LRU)
         self._image_cache_max = 500  # キャッシュ上限エントリ数
+        self._detail_render_timer = None  # 長押し通過後に詳細ペインを本描画する after() のID
+        self._space_held = False  # スペースが物理的に押されているか（KeyPress/KeyReleaseで更新）
+        self._space_repeat_timer = None  # 長押し中の連続ジャンプ after() のID
         self._loaded_tabs = set() # tab_keys that have been refreshed at least once
         self._tree_items = {} # tab_key -> tuple(item_id): 直近描画時の行ID一覧（get_children 呼び出し削減用）
         
@@ -507,156 +523,378 @@ class MainWindow:
         except Exception:
             pass
 
-    def _update_detail_view(self, window, tab, row_idx, tabs, skip_image_load=False):
-        # skip_image_load: 未読ジャンプ長押しで通過中の投稿。ネットワーク画像DLを省き応答性を優先する
-        #（キャッシュ済みは即時描画するので流用する）。
-        if row_idx < len(tab.posts):
-            post = tab.posts[row_idx]
-            self.current_selected_post = post
-            post.is_read = True
-            if hasattr(self, "_app_ref") and self._app_ref:
-                self._app_ref.read_post_uris.add(post.uri)
-            # 選択で既読になるのは表示中タブの1投稿のみ。全タブ再走査は不要なので対象タブだけ更新する。
-            self.apply_unread_tags(window, tabs, target_tab=tab)
-            
-            # Update detail view elements
-            window["-DETAIL_AUTHOR-"].update(post.author_display_name)
-            window["-DETAIL_HANDLE-"].update(f"@{post.author_handle}")
-            window["-DETAIL_DATE-"].update(post.created_at)
-            window["-DETAIL_REPOST-"].update(f"🔁 {post.repost_count}")
-            window["-DETAIL_LIKE-"].update(f"❤ {post.like_count}")
-            
-            # Show repost-by info if available
-            if getattr(post, 'is_repost', False) and getattr(post, 'reposted_by_author', None):
-                by_handle = getattr(post, 'reposted_by_handle', '') or ''
-                window["-DETAIL_REPOST_BY-"].update(f"🔁 reposted by {post.reposted_by_author} (@{by_handle})")
-            else:
-                window["-DETAIL_REPOST_BY-"].update("")
-            
-            if post.reply_to:
-                window["-DETAIL_REPLY-"].update(f"↩ @{post.reply_to}")
-            else:
-                window["-DETAIL_REPLY-"].update("")
-                
-            text_widget = window["-DETAIL_TEXT-"].widget
-            text_widget.config(state="normal")
-            text_widget.delete("1.0", "end")
-            
-            text_widget.insert(tk.END, post.text + "\n")
-            
-            if hasattr(post, 'reply_parent_text') and post.reply_parent_text:
-                text_widget.insert(tk.END, "\n\n")
-                
-                bg_color = text_widget.cget("bg")
-                fg_color = text_widget.cget("fg")
-                reply_frame = tk.Frame(text_widget, highlightbackground="pink", highlightthickness=1, bg=bg_color)
-                
-                content = post.reply_parent_text or ""
-                reply_txt = tk.Label(reply_frame, text=content, justify="left", anchor="nw", bg=bg_color, fg=fg_color, font=(self.font_family, self.font_size))
-                reply_txt.pack(fill="x", expand=True, padx=5, pady=(5, 0))
-                
-                meta_text = f"- {post.reply_parent_author} (@{post.reply_parent_handle})"
-                date_text = getattr(post, 'reply_parent_created_at', '')
-                if date_text: meta_text += f" {date_text}"
-                meta_label = tk.Label(reply_frame, text=meta_text, justify="left", bg=bg_color, fg="gray", font=(self.font_family, self.font_size - 1))
-                meta_label.pack(anchor="w", padx=5, pady=(0, 5))
-                
-                text_widget.window_create(tk.END, window=reply_frame, padx=10, pady=5)
-                
-                if not hasattr(text_widget, "_embedded_frames"):
-                    text_widget._embedded_frames = []
-                    def _on_resize(e):
-                        for f, lbl in text_widget._embedded_frames:
-                            try:
-                                if f.winfo_exists():
-                                    fw = e.width - 35
-                                    if fw > 0:
-                                        lbl.config(wraplength=fw - 15)
-                            except Exception:
-                                pass
-                    text_widget.bind("<Configure>", _on_resize, add="+")
-                
-                text_widget._embedded_frames = [(f, l) for f, l in text_widget._embedded_frames if f.winfo_exists()]
-                text_widget._embedded_frames.append((reply_frame, reply_txt))
-                
-                text_widget.after(10, lambda rt=reply_txt, tw=text_widget: rt.config(wraplength=max(100, tw.winfo_width() - 50)))
-            
-            import re
-            url_pattern = re.compile(r'https?://[^\s]+')
-            content = text_widget.get("1.0", "end-1c")
-            for match in url_pattern.finditer(content):
-                start_idx = f"1.0 + {match.start()} chars"
-                end_idx = f"1.0 + {match.end()} chars"
-                text_widget.tag_add("url", start_idx, end_idx)
-                
-            text_widget.config(state="disabled")
+    def _update_detail_view(self, window, tab, row_idx, tabs, fast_pass=False):
+        """選択された投稿を既読にし、詳細ペインを更新する。
+        fast_pass: 未読ジャンプ長押しで通過中。既読化と該当行のタグ張り替えだけ行い、
+        詳細ペインの描画と画像は着地後にまとめて反映する。"""
+        if row_idx >= len(tab.posts):
+            return
+        post = tab.posts[row_idx]
+        # ttk は selection_set() でも <<TreeviewSelect>> を発火するため、スペースジャンプ1回につき
+        # -TIMELINE_*- 経由の描画がもう一度走る。表示中の投稿と同じなら捨てる。
+        # （更新時は TimelineTabModel.update_posts が Post を作り直すので、
+        #   リフレッシュ後の再描画は妨げない）
+        if post is self.current_selected_post:
+            return
+        self.current_selected_post = post
+        post.is_read = True
+        if hasattr(self, "_app_ref") and self._app_ref:
+            self._app_ref.read_post_uris.add(post.uri)
+        self.current_image_idx = 0
 
-            # Handle author avatar
-            avatar_elem = window["-AUTHOR_AVATAR-"]
-            if post.avatar_url:
-                avatar_elem.erase()
-                cached = self._cache_get(post.avatar_url)
-                if cached is not None:
-                    # キャッシュヒット：即座にイベントを発行
-                    window.events.put(("-AVATAR_DOWNLOAD_COMPLETE-", {"data": cached}))
-                elif not skip_image_load:
-                    def download_avatar_thread(url, win):
+        if fast_pass:
+            # 既読になった1行ぶんだけ張り替える。全行走査も詳細ペインの描画もここではやらない
+            self._apply_unread_tag_for_row(window, tab, row_idx)
+            self._schedule_detail_render(window)
+            return
+
+        self._cancel_detail_render(window)
+        # 選択で既読になるのは表示中タブの1投稿のみ。全タブ再走査は不要なので対象タブだけ更新する。
+        self.apply_unread_tags(window, tabs, target_tab=tab)
+        self._render_detail_pane(window, post)
+        self._load_detail_images(window, post)
+
+    def _render_detail_pane(self, window, post):
+        """詳細ペインの見出し・本文・リプライ元・URLタグを描き直す。"""
+        # Update detail view elements
+        window["-DETAIL_AUTHOR-"].update(post.author_display_name)
+        window["-DETAIL_HANDLE-"].update(f"@{post.author_handle}")
+        window["-DETAIL_DATE-"].update(post.created_at)
+        window["-DETAIL_REPOST-"].update(f"🔁 {post.repost_count}")
+        window["-DETAIL_LIKE-"].update(f"❤ {post.like_count}")
+        
+        # Show repost-by info if available
+        if getattr(post, 'is_repost', False) and getattr(post, 'reposted_by_author', None):
+            by_handle = getattr(post, 'reposted_by_handle', '') or ''
+            window["-DETAIL_REPOST_BY-"].update(f"🔁 reposted by {post.reposted_by_author} (@{by_handle})")
+        else:
+            window["-DETAIL_REPOST_BY-"].update("")
+        
+        if post.reply_to:
+            window["-DETAIL_REPLY-"].update(f"↩ @{post.reply_to}")
+        else:
+            window["-DETAIL_REPLY-"].update("")
+            
+        text_widget = window["-DETAIL_TEXT-"].widget
+        text_widget.config(state="normal")
+        text_widget.delete("1.0", "end")
+        
+        text_widget.insert(tk.END, post.text + "\n")
+        
+        if hasattr(post, 'reply_parent_text') and post.reply_parent_text:
+            text_widget.insert(tk.END, "\n\n")
+            
+            bg_color = text_widget.cget("bg")
+            fg_color = text_widget.cget("fg")
+            reply_frame = tk.Frame(text_widget, highlightbackground="pink", highlightthickness=1, bg=bg_color)
+            
+            content = post.reply_parent_text or ""
+            reply_txt = tk.Label(reply_frame, text=content, justify="left", anchor="nw", bg=bg_color, fg=fg_color, font=(self.font_family, self.font_size))
+            reply_txt.pack(fill="x", expand=True, padx=5, pady=(5, 0))
+            
+            meta_text = f"- {post.reply_parent_author} (@{post.reply_parent_handle})"
+            date_text = getattr(post, 'reply_parent_created_at', '')
+            if date_text: meta_text += f" {date_text}"
+            meta_label = tk.Label(reply_frame, text=meta_text, justify="left", bg=bg_color, fg="gray", font=(self.font_family, self.font_size - 1))
+            meta_label.pack(anchor="w", padx=5, pady=(0, 5))
+            
+            text_widget.window_create(tk.END, window=reply_frame, padx=10, pady=5)
+            
+            if not hasattr(text_widget, "_embedded_frames"):
+                text_widget._embedded_frames = []
+                def _on_resize(e):
+                    for f, lbl in text_widget._embedded_frames:
                         try:
-                            resp = requests.get(url, timeout=10)
-                            if resp.status_code == 200:
-                                self._cache_put(url, resp.content)
-                                win.events.put(("-AVATAR_DOWNLOAD_COMPLETE-", {"data": resp.content}))
+                            if f.winfo_exists():
+                                fw = e.width - 35
+                                if fw > 0:
+                                    lbl.config(wraplength=fw - 15)
                         except Exception:
                             pass
-                    threading.Thread(target=download_avatar_thread, args=(post.avatar_url, window), daemon=True).start()
-            else:
-                avatar_elem.erase()
-
-            # Handle image preview
-            self.current_image_idx = 0
-            image_elem = window["-IMAGE-"]
-            idx_elem = window["-IMAGE_INDEX-"]
-            pane_elem = window["-DETAIL_PANED-"]
+                text_widget.bind("<Configure>", _on_resize, add="+")
             
-            if post.thumbnail_urls:
-                # Update index display
-                idx_text = f"1 / {len(post.thumbnail_urls)}" if len(post.thumbnail_urls) > 1 else ""
-                idx_elem.update(idx_text)
-                
-                # Show image area if hidden
-                pane_elem.set_pane2_visible(True)
-                # Force layout update to get valid winfo_width/height
-                window.window.update_idletasks()
-                
-                # Double check that the image widget itself is packed within the column
-                if not image_elem.widget.winfo_ismapped():
+            text_widget._embedded_frames = [(f, l) for f, l in text_widget._embedded_frames if f.winfo_exists()]
+            text_widget._embedded_frames.append((reply_frame, reply_txt))
+            
+            text_widget.after(10, lambda rt=reply_txt, tw=text_widget: rt.config(wraplength=max(100, tw.winfo_width() - 50)))
+        
+        import re
+        url_pattern = re.compile(r'https?://[^\s]+')
+        content = text_widget.get("1.0", "end-1c")
+        for match in url_pattern.finditer(content):
+            start_idx = f"1.0 + {match.start()} chars"
+            end_idx = f"1.0 + {match.end()} chars"
+            text_widget.tag_add("url", start_idx, end_idx)
+            
+        text_widget.config(state="disabled")
+
+
+    def _load_detail_images(self, window, post):
+        """詳細ペインのアバターとプレビュー画像を反映する。
+        キャッシュ済みは即描画、未キャッシュのみスレッドでDLして完了イベントを投げる。"""
+        # Handle author avatar
+        avatar_elem = window["-AUTHOR_AVATAR-"]
+        if post.avatar_url:
+            avatar_elem.erase()
+            cached = self._cache_get(post.avatar_url)
+            if cached is not None:
+                # キャッシュヒット：即座にイベントを発行
+                window.events.put(("-AVATAR_DOWNLOAD_COMPLETE-", {"data": cached}))
+            else:
+                def download_avatar_thread(url, win):
                     try:
-                        image_elem.widget.pack(expand=True, fill="both")
-                    except Exception: pass
-                
-                thumb_url = post.thumbnail_urls[0]
-                cached = self._cache_get(thumb_url)
-                if cached is not None:
-                    # キャッシュヒット：即座に描画
-                    self._display_image(window, cached)
-                elif not skip_image_load:
-                    # 新しい画像を読み込む間も古い画像を残すため、ここでは erase() しない
-                    def download_thumb_thread(url, win):
-                        try:
-                            resp = requests.get(url, timeout=10)
-                            if resp.status_code == 200:
-                                self._cache_put(url, resp.content)
-                                win.events.put(("-THUMB_DOWNLOAD_COMPLETE-", {"data": resp.content}))
-                                try: win.window.quit()
-                                except Exception: pass
-                        except Exception:
-                            pass
-                    threading.Thread(target=download_thumb_thread, args=(thumb_url, window), daemon=True).start()
+                        resp = requests.get(url, timeout=10)
+                        if resp.status_code == 200:
+                            self._cache_put(url, resp.content)
+                            win.events.put(("-AVATAR_DOWNLOAD_COMPLETE-", {"data": resp.content}))
+                    except Exception:
+                        pass
+                threading.Thread(target=download_avatar_thread, args=(post.avatar_url, window), daemon=True).start()
+        else:
+            avatar_elem.erase()
+
+        # Handle image preview
+        image_elem = window["-IMAGE-"]
+        idx_elem = window["-IMAGE_INDEX-"]
+        pane_elem = window["-DETAIL_PANED-"]
+
+        if post.thumbnail_urls:
+            # Update index display
+            idx_text = f"1 / {len(post.thumbnail_urls)}" if len(post.thumbnail_urls) > 1 else ""
+            idx_elem.update(idx_text)
+
+            # Show image area if hidden
+            pane_elem.set_pane2_visible(True)
+            # Force layout update to get valid winfo_width/height
+            window.window.update_idletasks()
+
+            # Double check that the image widget itself is packed within the column
+            if not image_elem.widget.winfo_ismapped():
+                try:
+                    image_elem.widget.pack(expand=True, fill="both")
+                except Exception: pass
+
+            thumb_url = post.thumbnail_urls[0]
+            cached = self._cache_get(thumb_url)
+            if cached is not None:
+                # キャッシュヒット：即座に描画
+                self._display_image(window, cached)
             else:
-                idx_elem.update("")
-                # Hide image area
-                pane_elem.set_pane2_visible(False)
-                image_elem.erase()
+                # 新しい画像を読み込む間も古い画像を残すため、ここでは erase() しない
+                def download_thumb_thread(url, win):
+                    try:
+                        resp = requests.get(url, timeout=10)
+                        if resp.status_code == 200:
+                            self._cache_put(url, resp.content)
+                            win.events.put(("-THUMB_DOWNLOAD_COMPLETE-", {"data": resp.content}))
+                            try: win.window.quit()
+                            except Exception: pass
+                    except Exception:
+                        pass
+                threading.Thread(target=download_thumb_thread, args=(thumb_url, window), daemon=True).start()
+        else:
+            idx_elem.update("")
+            # Hide image area
+            pane_elem.set_pane2_visible(False)
+            image_elem.erase()
+
+    def _schedule_detail_render(self, window):
+        """長押し通過中は詳細ペインの描画を丸ごと後回しにする。ジャンプのたびに張り直し、
+        キーが途切れて DETAIL_RENDER_SETTLE_MS 経過したら着地した投稿だけ描く。"""
+        self._cancel_detail_render(window)
+        self._detail_render_timer = window.window.after(
+            DETAIL_RENDER_SETTLE_MS, lambda: self._render_landed_post(window)
+        )
+
+    def _cancel_detail_render(self, window):
+        """保留中の遅延描画を取り消す。マウス選択など即時描画する経路の先頭で呼ぶ。"""
+        if self._detail_render_timer:
+            window.window.after_cancel(self._detail_render_timer)
+            self._detail_render_timer = None
+
+    def _render_landed_post(self, window):
+        """通過が終わった時点の投稿を本描画する。通過中に省いた分をここでまとめて反映する。"""
+        self._detail_render_timer = None
+        post = self.current_selected_post
+        self._render_detail_pane(window, post)
+        self._load_detail_images(window, post)
+
+    def _apply_unread_tag_for_row(self, window, tab, row_idx):
+        """既読になった1行だけタグを張り替える。通過中に全行(1タブぶん)を走査しないための軽量版。
+        タグの見た目定義は apply_unread_tags が設定済みのものをそのまま使う。"""
+        elem = window[f"-TIMELINE_{tab.tab_key}-"]
+        if not elem:
+            return
+        tree: ttk.Treeview = elem.widget
+        items = self._get_tree_items(tree, tab.tab_key)
+        if row_idx >= len(items):
+            return
+        post = tab.posts[row_idx]
+        tags = ["read"]
+        if getattr(post, 'is_repost', False):
+            tags.append("repost")
+        if getattr(post, 'is_follower', False):
+            tags.append("follower")
+        tree.item(items[row_idx], tags=tuple(tags))
+        self._update_tab_unread_indicator(window, tab)
+
+    def _is_space_input_blocked(self, window):
+        """入力欄で文字を打っている最中ならジャンプを無視する。
+        空欄なら（IMEが残した空白を消したうえで）ジャンプを通す。"""
+        focused = window.window.focus_get()
+        if not isinstance(focused, (tk.Entry, ttk.Entry, tk.Text)):
+            return False
+        if isinstance(focused, tk.Text):
+            if focused.get("1.0", "end-1c").strip() != "":
+                return True
+            focused.delete("1.0", "end")
+        else:
+            if focused.get().strip() != "":
+                return True
+            focused.delete(0, "end")
+        return False
+
+    def _on_space_press(self, window, tabs):
+        """スペース押下。単押しぶんを即座に送り、押し続けられたら連続送りに入る。
+        オートリピートのKeyPressは押下状態で弾くので、送り速度はタイマーだけが決める。"""
+        if self._space_held:
+            return
+        if self._is_space_input_blocked(window):
+            return
+        self._space_held = True
+        # 単押しはここで完結するので詳細ペインも画像もその場で描く
+        self._jump_to_next_unread(window, tabs, fast_pass=False)
+        self._space_repeat_timer = window.window.after(
+            SPACE_REPEAT_DELAY_MS, lambda: self._space_repeat_tick(window, tabs)
+        )
+
+    def _space_repeat_tick(self, window, tabs):
+        """長押し中の1送り。通過中は既読化だけに絞り、押されている間だけ自分を張り直す。"""
+        if not self._space_held:
+            self._space_repeat_timer = None
+            return
+        self._jump_to_next_unread(window, tabs, fast_pass=True)
+        self._space_repeat_timer = window.window.after(
+            SPACE_REPEAT_INTERVAL_MS, lambda: self._space_repeat_tick(window, tabs)
+        )
+
+    def _on_space_release(self, window):
+        """スペース解放。連続送りを即座に止め、通過中に省いた描画をここで反映する。"""
+        self._space_held = False
+        if self._space_repeat_timer:
+            window.window.after_cancel(self._space_repeat_timer)
+            self._space_repeat_timer = None
+        # 保留中＝直前の送りが描画を省いている。settleを待たずここで描く
+        if self._detail_render_timer:
+            self._cancel_detail_render(window)
+            self._render_landed_post(window)
+
+    def _jump_to_next_unread(self, window, tabs, fast_pass):
+        """現在タブを優先して最も古い未読へ移動する。未読が尽きたらホームタブ先頭へ戻る。"""
+        tab_group_elem = window["-TABGROUP-"]
+        if not tab_group_elem:
+            return
+
+        # Find which tab is visually selected
+        current_tab_id = tab_group_elem.widget.select()
+        current_tab_v_idx = tab_group_elem.widget.index(current_tab_id)
+
+        # Notebook.tabs() matches tabs in visual order
+        v_tabs = tab_group_elem.widget.tabs()
+        target_tab = None
+        target_unread_idx = -1
+
+        # Search starting from current visual index
+        for i in range(len(tabs)):
+            v_idx = (current_tab_v_idx + i) % len(tabs)
+            v_tab_id = v_tabs[v_idx]
+            # Find matching model by looking at its Tab widget id
+            matching_tab_model = None
+            for t_model in tabs:
+                tab_elem = window[f"-TAB_{t_model.tab_key}-"]
+                if tab_elem and str(tab_elem.widget) == v_tab_id:
+                    matching_tab_model = t_model
+                    break
+
+            if not matching_tab_model:
+                continue
+
+            # Find currently selected row if in this tab
+            start_idx = 0
+            table_elem = window[f"-TIMELINE_{matching_tab_model.tab_key}-"]
+            if table_elem:
+                tree: ttk.Treeview = table_elem.widget
+                sel = tree.selection()
+                if sel:
+                    items = tree.get_children()
+                    try:
+                        start_idx = items.index(sel[0]) + 1
+                    except ValueError:
+                        pass
+
+            # 表示は index 0 が最新なので、選択行より上（＝古い方から新しい方）へ遡る
+            sel_idx = start_idx - 1 if start_idx > 0 else len(matching_tab_model.posts)
+            found_in_tab = -1
+
+            for p_idx in range(sel_idx - 1, -1, -1):
+                if not matching_tab_model.posts[p_idx].is_read:
+                    found_in_tab = p_idx
+                    break
+
+            # If not found, wrap around to the bottom
+            if found_in_tab == -1:
+                for p_idx in range(len(matching_tab_model.posts) - 1, sel_idx, -1):
+                    if not matching_tab_model.posts[p_idx].is_read:
+                        found_in_tab = p_idx
+                        break
+
+            if found_in_tab != -1:
+                target_tab = matching_tab_model
+                target_unread_idx = found_in_tab
+                break
+
+        # target_tab が None のまま（全タブ未読なし）の場合
+        # 現在ホームタブの先頭ポストを見ていない場合はそこへジャンプ
+        if not target_tab and tabs:
+            home_tab = tabs[0]  # ホームタブ＝最初のタブ
+            home_table_elem = window[f"-TIMELINE_{home_tab.tab_key}-"]
+            if home_table_elem and home_tab.posts:
+                home_tree: ttk.Treeview = home_table_elem.widget
+                home_items = home_tree.get_children()
+                if home_items:
+                    # 現在選択中のビジュアルタブがホームかどうか
+                    home_tab_elem = window[f"-TAB_{home_tab.tab_key}-"]
+                    current_tab_widget = str(tab_group_elem.widget.select())
+                    home_tab_widget = str(home_tab_elem.widget) if home_tab_elem else ""
+                    is_on_home_tab = (current_tab_widget == home_tab_widget)
+
+                    # ホームタブの選択行
+                    currently_selected = home_tree.selection()
+                    is_on_first_row = (currently_selected and currently_selected[0] == home_items[0])
+
+                    # 別タブにいる OR ホームタブだが先頭が選択されていない → 飛ぶ
+                    if not is_on_home_tab or not is_on_first_row:
+                        target_tab = home_tab
+                        target_unread_idx = 0
+                        tab_group_elem.widget.select(home_tab_elem.widget)
+
+        if not target_tab:
+            return
+
+        # Switch to this tab visually
+        target_tab_elem = window[f"-TAB_{target_tab.tab_key}-"]
+        tab_group_elem.widget.select(target_tab_elem.widget)
+
+        # Select this row in the corresponding table
+        table_elem = window[f"-TIMELINE_{target_tab.tab_key}-"]
+        if table_elem:
+            tree: ttk.Treeview = table_elem.widget
+            items = tree.get_children()
+            if target_unread_idx < len(items):
+                item_id = items[target_unread_idx]
+                tree.selection_set(item_id)
+                tree.see(item_id)
+                self._update_detail_view(window, target_tab, target_unread_idx, tabs, fast_pass=fast_pass)
 
     def format_post_for_list(self, post):
         # Return a row for the table: [Name, Reply To, Text, Date, RT, Like]
@@ -699,21 +937,25 @@ class MainWindow:
                 tree.tag_configure("repost", foreground="forestgreen")
                 tree.tag_configure("follower", foreground="#CC6600")
 
-            # Update Tab title indicator
-            unread_count = sum(1 for p in tab.posts if not p.is_read)
-            tab_group_elem = window["-TABGROUP-"]
-            if tab_group_elem:
-                # Find visual index of this tab_key to update its title
-                try:
-                    # Notebook.tabs() returns list of child widgets
-                    tab_widgets = tab_group_elem.widget.tabs()
-                    tab_elem = window[f"-TAB_{tab.tab_key}-"]
-                    if tab_elem:
-                        v_idx = tab_widgets.index(str(tab_elem.widget))
-                        indicator = "● " if unread_count > 0 else ""
-                        tab_group_elem.widget.tab(v_idx, text=f"{indicator}{tab.name}")
-                except Exception:
-                    pass
+            self._update_tab_unread_indicator(window, tab)
+
+    def _update_tab_unread_indicator(self, window, tab):
+        """タブ見出しの未読マーク（● ）を現在の未読数に合わせる。"""
+        unread_count = sum(1 for p in tab.posts if not p.is_read)
+        tab_group_elem = window["-TABGROUP-"]
+        if not tab_group_elem:
+            return
+        # Find visual index of this tab_key to update its title
+        try:
+            # Notebook.tabs() returns list of child widgets
+            tab_widgets = tab_group_elem.widget.tabs()
+            tab_elem = window[f"-TAB_{tab.tab_key}-"]
+            if tab_elem:
+                v_idx = tab_widgets.index(str(tab_elem.widget))
+                indicator = "● " if unread_count > 0 else ""
+                tab_group_elem.widget.tab(v_idx, text=f"{indicator}{tab.name}")
+        except Exception:
+            pass
 
     def on_tab_reordered(self, tabs, old_index, new_index):
         """Called when a tab is visually reordered."""
@@ -1171,6 +1413,20 @@ class MainWindow:
         
         window["-IMAGE-"].widget.bind("<Configure>", _on_image_configure)
 
+        # 未読ジャンプはイベントキュー経由(-WINDOW_KEY_EVENT-)ではなく押下状態を直接見る。
+        # read() が1イベントごとに update()+mainloop() を回すため、キュー経由だとオートリピートが
+        # 溜まって送りが遅く、キーを離した後も積み残しが処理されて行き過ぎていた。
+        def _on_space_key_press(e):
+            if e.keysym in SPACE_KEYSYMS or e.char in (" ", "　"):
+                self._on_space_press(window, tabs)
+
+        def _on_space_key_release(e):
+            if e.keysym in SPACE_KEYSYMS or e.char in (" ", "　"):
+                self._on_space_release(window)
+
+        window.window.bind("<KeyPress>", _on_space_key_press, add="+")
+        window.window.bind("<KeyRelease>", _on_space_key_release, add="+")
+
         # Bind double-click, right-click and column-reorder events
         self._column_reorderers = {}  # tab_key -> ColumnReorderer
         for tab in tabs:
@@ -1209,6 +1465,11 @@ class MainWindow:
 
                 def make_select_handler(tab_key=tab.tab_key):
                     def handler(e):
+                        # スペース操作中の選択変更は _jump_to_next_unread が詳細ペインまで面倒を見る。
+                        # ここでイベントを積むと read() の往復（update()+mainloop()）が
+                        # 1ジャンプごとに丸ごと無駄になるので積まない。
+                        if self._space_held:
+                            return
                         window.dispatch_event(f"-TIMELINE_{tab_key}-")
                     return handler
                 table_elem.widget.bind("<<TreeviewSelect>>", make_select_handler())
@@ -1692,165 +1953,10 @@ class MainWindow:
                                 pass
                         threading.Thread(target=_dl_cycle, daemon=True).start()
             elif event == "-WINDOW_KEY_EVENT-":
-                key = values.get("key")
-                
-                if key == "F5":
+                # スペース（未読ジャンプ）は KeyPress/KeyRelease バインドで直接処理する
+                if values.get("key") == "F5":
                     window.dispatch_event("Refresh")
                     continue
-
-                # '??' is emitted by Windows Tkinter for Zenkaku Space and other unmapped IME keys.
-                if key in ("space", " ", "　", "??"):
-                    import time
-                    current_time = time.time()
-                    # 閾値を 0.1s に短縮（ユーザー要望、連打時の追従を速く / 長押しのチャタリングは抑止）
-                    if hasattr(self, '_last_space_time') and current_time - self._last_space_time < 0.1:
-                        continue
-
-                    # 長押し（オートリピート）判定: 直前の処理から間もなければ長押しで通過中とみなす
-                    is_key_held = current_time - getattr(self, '_last_space_time', 0.0) < 0.3
-
-                    # If the user is typing in a text field, ignore the shortcut UNLESS the field is empty
-                    focused = window.window.focus_get()
-                    import tkinter as _tk
-                    from tkinter import ttk as _ttk
-                    if isinstance(focused, (_tk.Entry, _ttk.Entry, _tk.Text)):
-                        is_empty = False
-                        if isinstance(focused, _tk.Text):
-                            val = focused.get("1.0", "end-1c")
-                            if val.strip() == "":
-                                is_empty = True
-                                focused.delete("1.0", "end")
-                        else:
-                            val = focused.get()
-                            if val.strip() == "":
-                                is_empty = True
-                                focused.delete(0, "end")
-                        
-                        if not is_empty:
-                            continue
-
-                    # Spacebar navigation: find oldest unread, prioritizing the current tab
-                    tab_group_elem = window["-TABGROUP-"]
-                    if tab_group_elem:
-                        # Find which tab is visually selected
-                        current_tab_id = tab_group_elem.widget.select()
-                        # Find the model that matches this visual tab
-                        current_tab = None
-                        current_tab_v_idx = tab_group_elem.widget.index(current_tab_id)
-                        
-                        # Notebook.tabs() matches tabs in visual order
-                        v_tabs = tab_group_elem.widget.tabs()
-                        target_tab = None
-                        target_unread_idx = -1
-                        
-                        # Search starting from current visual index
-                        for i in range(len(tabs)):
-                            v_idx = (current_tab_v_idx + i) % len(tabs)
-                            v_tab_id = v_tabs[v_idx]
-                            # Find matching model by looking at its Tab widget id
-                            matching_tab_model = None
-                            for t_model in tabs:
-                                tab_elem = window[f"-TAB_{t_model.tab_key}-"]
-                                if tab_elem and str(tab_elem.widget) == v_tab_id:
-                                    matching_tab_model = t_model
-                                    break
-                            
-                            if not matching_tab_model:
-                                continue
-                                
-                            # Find currently selected row if in this tab
-                            start_idx = 0
-                            table_elem = window[f"-TIMELINE_{matching_tab_model.tab_key}-"]
-                            if table_elem:
-                                tree: ttk.Treeview = table_elem.widget
-                                sel = tree.selection()
-                                if sel:
-                                    items = tree.get_children()
-                                    try:
-                                        start_idx = items.index(sel[0]) + 1
-                                    except ValueError:
-                                        pass
-
-                            # Search from start_idx - 1 upwards to youngest (index 0)
-                            found_in_tab = -1
-                            # Actually, we want to go from start_idx-1 down to 0
-                            # But wait, start_idx is the index of the element *below* the selected one.
-                            # If we want to find the next oldest, and index 0 is newest, index N is oldest.
-                            # "古い方からでなく新しい方から選択されてしまう" implies spacebar currently selects the NEWEST post first.
-                            # Wait, in the table, index 0 is the NEWEST post (top of the list).
-                            # If we go from start_idx (which is index+1) to len(posts), we are moving to OLDER posts.
-                            # But wait, if they say "古い方からでなく新しい方から" it means the current behavior is selecting NEW (top) -> OLD (bottom).
-                            # They want: OLD (bottom) -> NEW (top).
-                            # Which means moving UP the list (decreasing index).
-                            # So we should search from (start_idx - 2) down to 0. (Since start_idx = selected_idx + 1).
-                            # Let's cleanly define `sel_idx = start_idx - 1`. If no selection, `sel_idx = len(posts)`.
-                            sel_idx = start_idx - 1 if start_idx > 0 else len(matching_tab_model.posts)
-                            
-                            for p_idx in range(sel_idx - 1, -1, -1):
-                                if not matching_tab_model.posts[p_idx].is_read:
-                                    found_in_tab = p_idx
-                                    break
-                            
-                            # If not found, wrap around to the bottom
-                            if found_in_tab == -1:
-                                for p_idx in range(len(matching_tab_model.posts) - 1, sel_idx, -1):
-                                    if not matching_tab_model.posts[p_idx].is_read:
-                                        found_in_tab = p_idx
-                                        break
-                            
-                            if found_in_tab != -1:
-                                target_tab = matching_tab_model
-                                target_unread_idx = found_in_tab
-                                break
-                        
-                        # target_tab が None のまま（全タブ未読なし）の場合
-                        # 現在ホームタブの先頭ポストを見ていない場合はそこへジャンプ
-                        if not target_tab and tabs:
-                            home_tab = tabs[0]  # ホームタブ＝最初のタブ
-                            home_table_elem = window[f"-TIMELINE_{home_tab.tab_key}-"]
-                            if home_table_elem and home_tab.posts:
-                                home_tree: ttk.Treeview = home_table_elem.widget
-                                home_items = home_tree.get_children()
-                                if home_items:
-                                    # 現在選択中のビジュアルタブがホームかどうか
-                                    home_tab_elem = window[f"-TAB_{home_tab.tab_key}-"]
-                                    current_tab_widget = str(tab_group_elem.widget.select())
-                                    home_tab_widget = str(home_tab_elem.widget) if home_tab_elem else ""
-                                    is_on_home_tab = (current_tab_widget == home_tab_widget)
-                                    
-                                    # ホームタブの選択行
-                                    currently_selected = home_tree.selection()
-                                    is_on_first_row = (currently_selected and currently_selected[0] == home_items[0])
-                                    
-                                    # 別タブにいる OR ホームタブだが先頭が選択されていない → 飛ぶ
-                                    if not is_on_home_tab or not is_on_first_row:
-                                        target_tab = home_tab
-                                        target_unread_idx = 0
-                                        tab_group_elem.widget.select(home_tab_elem.widget)
-
-                        if target_tab:
-                            # Switch to this tab visually
-                            target_tab_elem = window[f"-TAB_{target_tab.tab_key}-"]
-                            tab_group_elem.widget.select(target_tab_elem.widget)
-                            
-                            # Select this row in the corresponding table
-                            table_elem = window[f"-TIMELINE_{target_tab.tab_key}-"]
-                            if table_elem:
-                                tree: ttk.Treeview = table_elem.widget
-                                items = tree.get_children()
-                                if target_unread_idx < len(items):
-                                    item_id = items[target_unread_idx]
-                                    tree.selection_set(item_id)
-                                    tree.see(item_id)
-                                    # 長押しで通過中かつ他に未読が残る場合は画像DLをスキップして応答性を優先
-                                    total_unread = sum(1 for t in tabs for p in t.posts if not p.is_read)
-                                    skip_image_load = is_key_held and total_unread > 1
-                                    # Update detail view manually
-                                    self._update_detail_view(window, target_tab, target_unread_idx, tabs, skip_image_load=skip_image_load)
-                    
-                    # 処理完了後に時刻を更新（ラグによる二重実行防止）
-                    import time
-                    self._last_space_time = time.time()
             elif event == "Refresh":
                 window.events.put(("-ASYNC_REFRESH_START-", {}))
             elif event == "-ASYNC_REFRESH_START-":
