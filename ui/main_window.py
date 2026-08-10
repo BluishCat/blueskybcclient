@@ -18,6 +18,10 @@ import windnd
 from PIL import Image as PILImage, ImageTk as PILImageTk, ImageGrab
 from utils.ui_config import save_ui_state, load_ui_state
 from utils.paths import get_resource_path
+from utils.version import __version__
+
+# ウィンドウタイトルの共通部分。ログイン後の統計付きタイトルも同じ前半を使う
+APP_TITLE = f"Bluesky BC Client v{__version__}"
 
 # 未読ジャンプ長押しの送り間隔。KeyPress/KeyRelease で押下状態を直接見て
 # after() で送るため、OSのキーリピート速度にもイベントキューの往復にも縛られない。
@@ -1117,7 +1121,7 @@ class MainWindow:
         ]
         
         window_size = self.ui_settings.get("window_size", (1100, 900))
-        window = eg.Window("Bluesky BC Client", layout, resizable=True, size=window_size, 
+        window = eg.Window(APP_TITLE, layout, resizable=True, size=window_size,
                            element_padding=(0, 0), enable_key_events=True)
         
         # Initial read to build widgets
@@ -1134,7 +1138,7 @@ class MainWindow:
                         followers = getattr(p, "followers_count", 0)
                         posts = getattr(p, "posts_count", 0)
                         # disp_name = getattr(p, "display_name", p.handle) or p.handle
-                        new_title = f"Bluesky BC Client - @{p.handle} [ フォロー: {follows} | フォロワー: {followers} | ポスト: {posts} ]"
+                        new_title = f"{APP_TITLE} - @{p.handle} [ フォロー: {follows} | フォロワー: {followers} | ポスト: {posts} ]"
                         window.events.put(("-UPDATE_TITLE-", {"title": new_title}))
             except Exception:
                 pass
