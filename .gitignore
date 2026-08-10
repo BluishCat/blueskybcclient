@@ -17,3 +17,5 @@
 /build
 __pycache__/
 /config.json
+/ui_config.json
+*.log

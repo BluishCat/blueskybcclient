@@ -1,18 +1,13 @@
 import TkEasyGUI as eg
-import logging
 import io
 import os
 import uuid
 import tkinter as tk
 from tkinter import ttk, font as tkfont, filedialog, messagebox
-from typing import Optional
 import requests
-import io
 import threading
 import webbrowser
 import queue
-import os
-import uuid
 from collections import OrderedDict
 import windnd
 from PIL import Image as PILImage, ImageTk as PILImageTk, ImageGrab
