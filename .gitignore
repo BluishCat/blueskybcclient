@@ -14,5 +14,6 @@
 /test_treeview_event.py
 /tmp
 /ui_main_window_settings_methods.py.tmp
-/__pycache__
+/build
+__pycache__/
 /config.json
