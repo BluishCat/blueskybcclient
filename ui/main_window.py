@@ -26,9 +26,9 @@ from utils.paths import get_resource_path
 SPACE_REPEAT_INTERVAL_MS = 16
 # 長押しと単押しを分ける待ち。これを超えて押され続けたときだけ連続送りに入る。
 SPACE_REPEAT_DELAY_MS = 300
-# 詳細ペインの画像を読み込むまでの待ち。通常はキーを離した時点で即読み込むので、
+# 詳細ペインを本描画するまでの待ち。通常はキーを離した時点で即描画するので、
 # フォーカス喪失などで KeyRelease を取りこぼした場合の保険として働く。
-DETAIL_IMAGE_SETTLE_MS = 250
+DETAIL_RENDER_SETTLE_MS = 250
 # Windows Tkinter は全角スペースやIME経由のキーに '??' を返すことがある。
 SPACE_KEYSYMS = ("space", " ", "　", "??")
 
@@ -400,7 +400,7 @@ class MainWindow:
         self._prefetch_workers_started = False
         self._image_cache = OrderedDict()  # url -> bytes (共有URLキャッシュ, LRU)
         self._image_cache_max = 500  # キャッシュ上限エントリ数
-        self._detail_image_timer = None  # 長押し通過後に画像を読み込む after() のID
+        self._detail_render_timer = None  # 長押し通過後に詳細ペインを本描画する after() のID
         self._space_held = False  # スペースが物理的に押されているか（KeyPress/KeyReleaseで更新）
         self._space_repeat_timer = None  # 長押し中の連続ジャンプ after() のID
         self._loaded_tabs = set() # tab_keys that have been refreshed at least once
@@ -523,102 +523,111 @@ class MainWindow:
         except Exception:
             pass
 
-    def _update_detail_view(self, window, tab, row_idx, tabs, skip_image_load=False):
-        # skip_image_load: 未読ジャンプ長押しで通過中の投稿。画像処理を丸ごと後回しにして
-        # ジャンプの応答性を優先し、キーが途切れてから着地点だけ読み込む。
-        if row_idx < len(tab.posts):
-            post = tab.posts[row_idx]
-            # ttk は selection_set() でも <<TreeviewSelect>> を発火するため、スペースジャンプ1回につき
-            # -TIMELINE_*- 経由の描画がもう一度走る。表示中の投稿と同じなら捨てる。
-            # （更新時は TimelineTabModel.update_posts が Post を作り直すので、
-            #   リフレッシュ後の再描画は妨げない）
-            if post is self.current_selected_post:
-                return
-            self.current_selected_post = post
-            post.is_read = True
-            if hasattr(self, "_app_ref") and self._app_ref:
-                self._app_ref.read_post_uris.add(post.uri)
-            # 選択で既読になるのは表示中タブの1投稿のみ。全タブ再走査は不要なので対象タブだけ更新する。
-            self.apply_unread_tags(window, tabs, target_tab=tab)
-            
-            # Update detail view elements
-            window["-DETAIL_AUTHOR-"].update(post.author_display_name)
-            window["-DETAIL_HANDLE-"].update(f"@{post.author_handle}")
-            window["-DETAIL_DATE-"].update(post.created_at)
-            window["-DETAIL_REPOST-"].update(f"🔁 {post.repost_count}")
-            window["-DETAIL_LIKE-"].update(f"❤ {post.like_count}")
-            
-            # Show repost-by info if available
-            if getattr(post, 'is_repost', False) and getattr(post, 'reposted_by_author', None):
-                by_handle = getattr(post, 'reposted_by_handle', '') or ''
-                window["-DETAIL_REPOST_BY-"].update(f"🔁 reposted by {post.reposted_by_author} (@{by_handle})")
-            else:
-                window["-DETAIL_REPOST_BY-"].update("")
-            
-            if post.reply_to:
-                window["-DETAIL_REPLY-"].update(f"↩ @{post.reply_to}")
-            else:
-                window["-DETAIL_REPLY-"].update("")
-                
-            text_widget = window["-DETAIL_TEXT-"].widget
-            text_widget.config(state="normal")
-            text_widget.delete("1.0", "end")
-            
-            text_widget.insert(tk.END, post.text + "\n")
-            
-            if hasattr(post, 'reply_parent_text') and post.reply_parent_text:
-                text_widget.insert(tk.END, "\n\n")
-                
-                bg_color = text_widget.cget("bg")
-                fg_color = text_widget.cget("fg")
-                reply_frame = tk.Frame(text_widget, highlightbackground="pink", highlightthickness=1, bg=bg_color)
-                
-                content = post.reply_parent_text or ""
-                reply_txt = tk.Label(reply_frame, text=content, justify="left", anchor="nw", bg=bg_color, fg=fg_color, font=(self.font_family, self.font_size))
-                reply_txt.pack(fill="x", expand=True, padx=5, pady=(5, 0))
-                
-                meta_text = f"- {post.reply_parent_author} (@{post.reply_parent_handle})"
-                date_text = getattr(post, 'reply_parent_created_at', '')
-                if date_text: meta_text += f" {date_text}"
-                meta_label = tk.Label(reply_frame, text=meta_text, justify="left", bg=bg_color, fg="gray", font=(self.font_family, self.font_size - 1))
-                meta_label.pack(anchor="w", padx=5, pady=(0, 5))
-                
-                text_widget.window_create(tk.END, window=reply_frame, padx=10, pady=5)
-                
-                if not hasattr(text_widget, "_embedded_frames"):
-                    text_widget._embedded_frames = []
-                    def _on_resize(e):
-                        for f, lbl in text_widget._embedded_frames:
-                            try:
-                                if f.winfo_exists():
-                                    fw = e.width - 35
-                                    if fw > 0:
-                                        lbl.config(wraplength=fw - 15)
-                            except Exception:
-                                pass
-                    text_widget.bind("<Configure>", _on_resize, add="+")
-                
-                text_widget._embedded_frames = [(f, l) for f, l in text_widget._embedded_frames if f.winfo_exists()]
-                text_widget._embedded_frames.append((reply_frame, reply_txt))
-                
-                text_widget.after(10, lambda rt=reply_txt, tw=text_widget: rt.config(wraplength=max(100, tw.winfo_width() - 50)))
-            
-            import re
-            url_pattern = re.compile(r'https?://[^\s]+')
-            content = text_widget.get("1.0", "end-1c")
-            for match in url_pattern.finditer(content):
-                start_idx = f"1.0 + {match.start()} chars"
-                end_idx = f"1.0 + {match.end()} chars"
-                text_widget.tag_add("url", start_idx, end_idx)
-                
-            text_widget.config(state="disabled")
+    def _update_detail_view(self, window, tab, row_idx, tabs, fast_pass=False):
+        """選択された投稿を既読にし、詳細ペインを更新する。
+        fast_pass: 未読ジャンプ長押しで通過中。既読化と該当行のタグ張り替えだけ行い、
+        詳細ペインの描画と画像は着地後にまとめて反映する。"""
+        if row_idx >= len(tab.posts):
+            return
+        post = tab.posts[row_idx]
+        # ttk は selection_set() でも <<TreeviewSelect>> を発火するため、スペースジャンプ1回につき
+        # -TIMELINE_*- 経由の描画がもう一度走る。表示中の投稿と同じなら捨てる。
+        # （更新時は TimelineTabModel.update_posts が Post を作り直すので、
+        #   リフレッシュ後の再描画は妨げない）
+        if post is self.current_selected_post:
+            return
+        self.current_selected_post = post
+        post.is_read = True
+        if hasattr(self, "_app_ref") and self._app_ref:
+            self._app_ref.read_post_uris.add(post.uri)
+        self.current_image_idx = 0
 
-            self.current_image_idx = 0
-            if skip_image_load:
-                self._schedule_detail_image_load(window)
-            else:
-                self._cancel_detail_image_load(window)
-                self._load_detail_images(window, post)
+        if fast_pass:
+            # 既読になった1行ぶんだけ張り替える。全行走査も詳細ペインの描画もここではやらない
+            self._apply_unread_tag_for_row(window, tab, row_idx)
+            self._schedule_detail_render(window)
+            return
+
+        self._cancel_detail_render(window)
+        # 選択で既読になるのは表示中タブの1投稿のみ。全タブ再走査は不要なので対象タブだけ更新する。
+        self.apply_unread_tags(window, tabs, target_tab=tab)
+        self._render_detail_pane(window, post)
+        self._load_detail_images(window, post)
+
+    def _render_detail_pane(self, window, post):
+        """詳細ペインの見出し・本文・リプライ元・URLタグを描き直す。"""
+        # Update detail view elements
+        window["-DETAIL_AUTHOR-"].update(post.author_display_name)
+        window["-DETAIL_HANDLE-"].update(f"@{post.author_handle}")
+        window["-DETAIL_DATE-"].update(post.created_at)
+        window["-DETAIL_REPOST-"].update(f"🔁 {post.repost_count}")
+        window["-DETAIL_LIKE-"].update(f"❤ {post.like_count}")
+        
+        # Show repost-by info if available
+        if getattr(post, 'is_repost', False) and getattr(post, 'reposted_by_author', None):
+            by_handle = getattr(post, 'reposted_by_handle', '') or ''
+            window["-DETAIL_REPOST_BY-"].update(f"🔁 reposted by {post.reposted_by_author} (@{by_handle})")
+        else:
+            window["-DETAIL_REPOST_BY-"].update("")
+        
+        if post.reply_to:
+            window["-DETAIL_REPLY-"].update(f"↩ @{post.reply_to}")
+        else:
+            window["-DETAIL_REPLY-"].update("")
+            
+        text_widget = window["-DETAIL_TEXT-"].widget
+        text_widget.config(state="normal")
+        text_widget.delete("1.0", "end")
+        
+        text_widget.insert(tk.END, post.text + "\n")
+        
+        if hasattr(post, 'reply_parent_text') and post.reply_parent_text:
+            text_widget.insert(tk.END, "\n\n")
+            
+            bg_color = text_widget.cget("bg")
+            fg_color = text_widget.cget("fg")
+            reply_frame = tk.Frame(text_widget, highlightbackground="pink", highlightthickness=1, bg=bg_color)
+            
+            content = post.reply_parent_text or ""
+            reply_txt = tk.Label(reply_frame, text=content, justify="left", anchor="nw", bg=bg_color, fg=fg_color, font=(self.font_family, self.font_size))
+            reply_txt.pack(fill="x", expand=True, padx=5, pady=(5, 0))
+            
+            meta_text = f"- {post.reply_parent_author} (@{post.reply_parent_handle})"
+            date_text = getattr(post, 'reply_parent_created_at', '')
+            if date_text: meta_text += f" {date_text}"
+            meta_label = tk.Label(reply_frame, text=meta_text, justify="left", bg=bg_color, fg="gray", font=(self.font_family, self.font_size - 1))
+            meta_label.pack(anchor="w", padx=5, pady=(0, 5))
+            
+            text_widget.window_create(tk.END, window=reply_frame, padx=10, pady=5)
+            
+            if not hasattr(text_widget, "_embedded_frames"):
+                text_widget._embedded_frames = []
+                def _on_resize(e):
+                    for f, lbl in text_widget._embedded_frames:
+                        try:
+                            if f.winfo_exists():
+                                fw = e.width - 35
+                                if fw > 0:
+                                    lbl.config(wraplength=fw - 15)
+                        except Exception:
+                            pass
+                text_widget.bind("<Configure>", _on_resize, add="+")
+            
+            text_widget._embedded_frames = [(f, l) for f, l in text_widget._embedded_frames if f.winfo_exists()]
+            text_widget._embedded_frames.append((reply_frame, reply_txt))
+            
+            text_widget.after(10, lambda rt=reply_txt, tw=text_widget: rt.config(wraplength=max(100, tw.winfo_width() - 50)))
+        
+        import re
+        url_pattern = re.compile(r'https?://[^\s]+')
+        content = text_widget.get("1.0", "end-1c")
+        for match in url_pattern.finditer(content):
+            start_idx = f"1.0 + {match.start()} chars"
+            end_idx = f"1.0 + {match.end()} chars"
+            text_widget.tag_add("url", start_idx, end_idx)
+            
+        text_widget.config(state="disabled")
+
 
     def _load_detail_images(self, window, post):
         """詳細ペインのアバターとプレビュー画像を反映する。
@@ -689,20 +698,45 @@ class MainWindow:
             pane_elem.set_pane2_visible(False)
             image_elem.erase()
 
-    def _schedule_detail_image_load(self, window):
-        """長押し通過中は画像処理を丸ごと後回しにする。ジャンプのたびに張り直し、
-        キーが途切れて DETAIL_IMAGE_SETTLE_MS 経過したら着地した投稿だけ読み込む。"""
-        self._cancel_detail_image_load(window)
-        self._detail_image_timer = window.window.after(
-            DETAIL_IMAGE_SETTLE_MS,
-            lambda: self._load_detail_images(window, self.current_selected_post),
+    def _schedule_detail_render(self, window):
+        """長押し通過中は詳細ペインの描画を丸ごと後回しにする。ジャンプのたびに張り直し、
+        キーが途切れて DETAIL_RENDER_SETTLE_MS 経過したら着地した投稿だけ描く。"""
+        self._cancel_detail_render(window)
+        self._detail_render_timer = window.window.after(
+            DETAIL_RENDER_SETTLE_MS, lambda: self._render_landed_post(window)
         )
 
-    def _cancel_detail_image_load(self, window):
-        """保留中の遅延ロードを取り消す。マウス選択など即時描画する経路の先頭で呼ぶ。"""
-        if self._detail_image_timer:
-            window.window.after_cancel(self._detail_image_timer)
-            self._detail_image_timer = None
+    def _cancel_detail_render(self, window):
+        """保留中の遅延描画を取り消す。マウス選択など即時描画する経路の先頭で呼ぶ。"""
+        if self._detail_render_timer:
+            window.window.after_cancel(self._detail_render_timer)
+            self._detail_render_timer = None
+
+    def _render_landed_post(self, window):
+        """通過が終わった時点の投稿を本描画する。通過中に省いた分をここでまとめて反映する。"""
+        self._detail_render_timer = None
+        post = self.current_selected_post
+        self._render_detail_pane(window, post)
+        self._load_detail_images(window, post)
+
+    def _apply_unread_tag_for_row(self, window, tab, row_idx):
+        """既読になった1行だけタグを張り替える。通過中に全行(1タブぶん)を走査しないための軽量版。
+        タグの見た目定義は apply_unread_tags が設定済みのものをそのまま使う。"""
+        elem = window[f"-TIMELINE_{tab.tab_key}-"]
+        if not elem:
+            return
+        tree: ttk.Treeview = elem.widget
+        items = self._get_tree_items(tree, tab.tab_key)
+        if row_idx >= len(items):
+            return
+        post = tab.posts[row_idx]
+        tags = ["read"]
+        if getattr(post, 'is_repost', False):
+            tags.append("repost")
+        if getattr(post, 'is_follower', False):
+            tags.append("follower")
+        tree.item(items[row_idx], tags=tuple(tags))
+        self._update_tab_unread_indicator(window, tab)
 
     def _is_space_input_blocked(self, window):
         """入力欄で文字を打っている最中ならジャンプを無視する。
@@ -728,34 +762,34 @@ class MainWindow:
         if self._is_space_input_blocked(window):
             return
         self._space_held = True
-        # 単押しはここで完結するので画像も即座に読み込む
-        self._jump_to_next_unread(window, tabs, skip_image_load=False)
+        # 単押しはここで完結するので詳細ペインも画像もその場で描く
+        self._jump_to_next_unread(window, tabs, fast_pass=False)
         self._space_repeat_timer = window.window.after(
             SPACE_REPEAT_DELAY_MS, lambda: self._space_repeat_tick(window, tabs)
         )
 
     def _space_repeat_tick(self, window, tabs):
-        """長押し中の1送り。通過中は画像処理を省き、押されている間だけ自分を張り直す。"""
+        """長押し中の1送り。通過中は既読化だけに絞り、押されている間だけ自分を張り直す。"""
         if not self._space_held:
             self._space_repeat_timer = None
             return
-        self._jump_to_next_unread(window, tabs, skip_image_load=True)
+        self._jump_to_next_unread(window, tabs, fast_pass=True)
         self._space_repeat_timer = window.window.after(
             SPACE_REPEAT_INTERVAL_MS, lambda: self._space_repeat_tick(window, tabs)
         )
 
     def _on_space_release(self, window):
-        """スペース解放。連続送りを即座に止め、通過中にスキップした画像を読み込む。"""
+        """スペース解放。連続送りを即座に止め、通過中に省いた描画をここで反映する。"""
         self._space_held = False
         if self._space_repeat_timer:
             window.window.after_cancel(self._space_repeat_timer)
             self._space_repeat_timer = None
-        # 保留中＝直前の送りが画像をスキップしている。settleを待たずここで読み込む
-        if self._detail_image_timer:
-            self._cancel_detail_image_load(window)
-            self._load_detail_images(window, self.current_selected_post)
+        # 保留中＝直前の送りが描画を省いている。settleを待たずここで描く
+        if self._detail_render_timer:
+            self._cancel_detail_render(window)
+            self._render_landed_post(window)
 
-    def _jump_to_next_unread(self, window, tabs, skip_image_load):
+    def _jump_to_next_unread(self, window, tabs, fast_pass):
         """現在タブを優先して最も古い未読へ移動する。未読が尽きたらホームタブ先頭へ戻る。"""
         tab_group_elem = window["-TABGROUP-"]
         if not tab_group_elem:
@@ -860,7 +894,7 @@ class MainWindow:
                 item_id = items[target_unread_idx]
                 tree.selection_set(item_id)
                 tree.see(item_id)
-                self._update_detail_view(window, target_tab, target_unread_idx, tabs, skip_image_load=skip_image_load)
+                self._update_detail_view(window, target_tab, target_unread_idx, tabs, fast_pass=fast_pass)
 
     def format_post_for_list(self, post):
         # Return a row for the table: [Name, Reply To, Text, Date, RT, Like]
@@ -903,21 +937,25 @@ class MainWindow:
                 tree.tag_configure("repost", foreground="forestgreen")
                 tree.tag_configure("follower", foreground="#CC6600")
 
-            # Update Tab title indicator
-            unread_count = sum(1 for p in tab.posts if not p.is_read)
-            tab_group_elem = window["-TABGROUP-"]
-            if tab_group_elem:
-                # Find visual index of this tab_key to update its title
-                try:
-                    # Notebook.tabs() returns list of child widgets
-                    tab_widgets = tab_group_elem.widget.tabs()
-                    tab_elem = window[f"-TAB_{tab.tab_key}-"]
-                    if tab_elem:
-                        v_idx = tab_widgets.index(str(tab_elem.widget))
-                        indicator = "● " if unread_count > 0 else ""
-                        tab_group_elem.widget.tab(v_idx, text=f"{indicator}{tab.name}")
-                except Exception:
-                    pass
+            self._update_tab_unread_indicator(window, tab)
+
+    def _update_tab_unread_indicator(self, window, tab):
+        """タブ見出しの未読マーク（● ）を現在の未読数に合わせる。"""
+        unread_count = sum(1 for p in tab.posts if not p.is_read)
+        tab_group_elem = window["-TABGROUP-"]
+        if not tab_group_elem:
+            return
+        # Find visual index of this tab_key to update its title
+        try:
+            # Notebook.tabs() returns list of child widgets
+            tab_widgets = tab_group_elem.widget.tabs()
+            tab_elem = window[f"-TAB_{tab.tab_key}-"]
+            if tab_elem:
+                v_idx = tab_widgets.index(str(tab_elem.widget))
+                indicator = "● " if unread_count > 0 else ""
+                tab_group_elem.widget.tab(v_idx, text=f"{indicator}{tab.name}")
+        except Exception:
+            pass
 
     def on_tab_reordered(self, tabs, old_index, new_index):
         """Called when a tab is visually reordered."""
@@ -1427,6 +1465,11 @@ class MainWindow:
 
                 def make_select_handler(tab_key=tab.tab_key):
                     def handler(e):
+                        # スペース操作中の選択変更は _jump_to_next_unread が詳細ペインまで面倒を見る。
+                        # ここでイベントを積むと read() の往復（update()+mainloop()）が
+                        # 1ジャンプごとに丸ごと無駄になるので積まない。
+                        if self._space_held:
+                            return
                         window.dispatch_event(f"-TIMELINE_{tab_key}-")
                     return handler
                 table_elem.widget.bind("<<TreeviewSelect>>", make_select_handler())
