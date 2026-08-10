@@ -21,7 +21,9 @@ from utils.paths import get_resource_path
 
 # 未読ジャンプ長押しの送り間隔。KeyPress/KeyRelease で押下状態を直接見て
 # after() で送るため、OSのキーリピート速度にもイベントキューの往復にも縛られない。
-SPACE_REPEAT_INTERVAL_MS = 40
+# 16ms は Tk のタイマー分解能と画面のリフレッシュ(60Hz)から見た実質的な下限。
+# これ以上詰めても描画が追いつかないので、残る速度は1投稿の処理時間で決まる。
+SPACE_REPEAT_INTERVAL_MS = 16
 # 長押しと単押しを分ける待ち。これを超えて押され続けたときだけ連続送りに入る。
 SPACE_REPEAT_DELAY_MS = 300
 # 詳細ペインの画像を読み込むまでの待ち。通常はキーを離した時点で即読み込むので、
