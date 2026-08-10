@@ -19,6 +19,13 @@ from PIL import Image as PILImage, ImageTk as PILImageTk, ImageGrab
 from utils.ui_config import save_ui_state, load_ui_state
 from utils.paths import get_resource_path
 
+# 未読ジャンプ長押しの判定窓。Windowsのキーリピート開始遅延（既定 約500ms）を跨いでも
+# 「通過中」と見なせるよう余裕を持たせる。
+SPACE_HOLD_WINDOW_SEC = 0.8
+# 長押しが途切れてから詳細ペインの画像を読み込むまでの待ち。
+# ジャンプのスロットル(0.1s)より十分長く、通過中に誤発火しない値。
+DETAIL_IMAGE_SETTLE_MS = 250
+
 # --- TkEasyGUI compatibility fix for version 1.0.40 ---
 # TkEasyGUI's _widget_update() stores all kwargs (including `visible`) into
 # self.props. When that element object is later used to create a widget,
@@ -387,6 +394,7 @@ class MainWindow:
         self._prefetch_workers_started = False
         self._image_cache = OrderedDict()  # url -> bytes (共有URLキャッシュ, LRU)
         self._image_cache_max = 500  # キャッシュ上限エントリ数
+        self._detail_image_timer = None  # 長押し通過後に画像を読み込む after() のID
         self._loaded_tabs = set() # tab_keys that have been refreshed at least once
         self._tree_items = {} # tab_key -> tuple(item_id): 直近描画時の行ID一覧（get_children 呼び出し削減用）
         
@@ -508,10 +516,16 @@ class MainWindow:
             pass
 
     def _update_detail_view(self, window, tab, row_idx, tabs, skip_image_load=False):
-        # skip_image_load: 未読ジャンプ長押しで通過中の投稿。ネットワーク画像DLを省き応答性を優先する
-        #（キャッシュ済みは即時描画するので流用する）。
+        # skip_image_load: 未読ジャンプ長押しで通過中の投稿。画像処理を丸ごと後回しにして
+        # ジャンプの応答性を優先し、キーが途切れてから着地点だけ読み込む。
         if row_idx < len(tab.posts):
             post = tab.posts[row_idx]
+            # ttk は selection_set() でも <<TreeviewSelect>> を発火するため、スペースジャンプ1回につき
+            # -TIMELINE_*- 経由の描画がもう一度走る。表示中の投稿と同じなら捨てる。
+            # （更新時は TimelineTabModel.update_posts が Post を作り直すので、
+            #   リフレッシュ後の再描画は妨げない）
+            if post is self.current_selected_post:
+                return
             self.current_selected_post = post
             post.is_read = True
             if hasattr(self, "_app_ref") and self._app_ref:
@@ -591,72 +605,96 @@ class MainWindow:
                 
             text_widget.config(state="disabled")
 
-            # Handle author avatar
-            avatar_elem = window["-AUTHOR_AVATAR-"]
-            if post.avatar_url:
-                avatar_elem.erase()
-                cached = self._cache_get(post.avatar_url)
-                if cached is not None:
-                    # キャッシュヒット：即座にイベントを発行
-                    window.events.put(("-AVATAR_DOWNLOAD_COMPLETE-", {"data": cached}))
-                elif not skip_image_load:
-                    def download_avatar_thread(url, win):
-                        try:
-                            resp = requests.get(url, timeout=10)
-                            if resp.status_code == 200:
-                                self._cache_put(url, resp.content)
-                                win.events.put(("-AVATAR_DOWNLOAD_COMPLETE-", {"data": resp.content}))
-                        except Exception:
-                            pass
-                    threading.Thread(target=download_avatar_thread, args=(post.avatar_url, window), daemon=True).start()
-            else:
-                avatar_elem.erase()
-
-            # Handle image preview
             self.current_image_idx = 0
-            image_elem = window["-IMAGE-"]
-            idx_elem = window["-IMAGE_INDEX-"]
-            pane_elem = window["-DETAIL_PANED-"]
-            
-            if post.thumbnail_urls:
-                # Update index display
-                idx_text = f"1 / {len(post.thumbnail_urls)}" if len(post.thumbnail_urls) > 1 else ""
-                idx_elem.update(idx_text)
-                
-                # Show image area if hidden
-                pane_elem.set_pane2_visible(True)
-                # Force layout update to get valid winfo_width/height
-                window.window.update_idletasks()
-                
-                # Double check that the image widget itself is packed within the column
-                if not image_elem.widget.winfo_ismapped():
-                    try:
-                        image_elem.widget.pack(expand=True, fill="both")
-                    except Exception: pass
-                
-                thumb_url = post.thumbnail_urls[0]
-                cached = self._cache_get(thumb_url)
-                if cached is not None:
-                    # キャッシュヒット：即座に描画
-                    self._display_image(window, cached)
-                elif not skip_image_load:
-                    # 新しい画像を読み込む間も古い画像を残すため、ここでは erase() しない
-                    def download_thumb_thread(url, win):
-                        try:
-                            resp = requests.get(url, timeout=10)
-                            if resp.status_code == 200:
-                                self._cache_put(url, resp.content)
-                                win.events.put(("-THUMB_DOWNLOAD_COMPLETE-", {"data": resp.content}))
-                                try: win.window.quit()
-                                except Exception: pass
-                        except Exception:
-                            pass
-                    threading.Thread(target=download_thumb_thread, args=(thumb_url, window), daemon=True).start()
+            if skip_image_load:
+                self._schedule_detail_image_load(window)
             else:
-                idx_elem.update("")
-                # Hide image area
-                pane_elem.set_pane2_visible(False)
-                image_elem.erase()
+                self._cancel_detail_image_load(window)
+                self._load_detail_images(window, post)
+
+    def _load_detail_images(self, window, post):
+        """詳細ペインのアバターとプレビュー画像を反映する。
+        キャッシュ済みは即描画、未キャッシュのみスレッドでDLして完了イベントを投げる。"""
+        # Handle author avatar
+        avatar_elem = window["-AUTHOR_AVATAR-"]
+        if post.avatar_url:
+            avatar_elem.erase()
+            cached = self._cache_get(post.avatar_url)
+            if cached is not None:
+                # キャッシュヒット：即座にイベントを発行
+                window.events.put(("-AVATAR_DOWNLOAD_COMPLETE-", {"data": cached}))
+            else:
+                def download_avatar_thread(url, win):
+                    try:
+                        resp = requests.get(url, timeout=10)
+                        if resp.status_code == 200:
+                            self._cache_put(url, resp.content)
+                            win.events.put(("-AVATAR_DOWNLOAD_COMPLETE-", {"data": resp.content}))
+                    except Exception:
+                        pass
+                threading.Thread(target=download_avatar_thread, args=(post.avatar_url, window), daemon=True).start()
+        else:
+            avatar_elem.erase()
+
+        # Handle image preview
+        image_elem = window["-IMAGE-"]
+        idx_elem = window["-IMAGE_INDEX-"]
+        pane_elem = window["-DETAIL_PANED-"]
+
+        if post.thumbnail_urls:
+            # Update index display
+            idx_text = f"1 / {len(post.thumbnail_urls)}" if len(post.thumbnail_urls) > 1 else ""
+            idx_elem.update(idx_text)
+
+            # Show image area if hidden
+            pane_elem.set_pane2_visible(True)
+            # Force layout update to get valid winfo_width/height
+            window.window.update_idletasks()
+
+            # Double check that the image widget itself is packed within the column
+            if not image_elem.widget.winfo_ismapped():
+                try:
+                    image_elem.widget.pack(expand=True, fill="both")
+                except Exception: pass
+
+            thumb_url = post.thumbnail_urls[0]
+            cached = self._cache_get(thumb_url)
+            if cached is not None:
+                # キャッシュヒット：即座に描画
+                self._display_image(window, cached)
+            else:
+                # 新しい画像を読み込む間も古い画像を残すため、ここでは erase() しない
+                def download_thumb_thread(url, win):
+                    try:
+                        resp = requests.get(url, timeout=10)
+                        if resp.status_code == 200:
+                            self._cache_put(url, resp.content)
+                            win.events.put(("-THUMB_DOWNLOAD_COMPLETE-", {"data": resp.content}))
+                            try: win.window.quit()
+                            except Exception: pass
+                    except Exception:
+                        pass
+                threading.Thread(target=download_thumb_thread, args=(thumb_url, window), daemon=True).start()
+        else:
+            idx_elem.update("")
+            # Hide image area
+            pane_elem.set_pane2_visible(False)
+            image_elem.erase()
+
+    def _schedule_detail_image_load(self, window):
+        """長押し通過中は画像処理を丸ごと後回しにする。ジャンプのたびに張り直し、
+        キーが途切れて DETAIL_IMAGE_SETTLE_MS 経過したら着地した投稿だけ読み込む。"""
+        self._cancel_detail_image_load(window)
+        self._detail_image_timer = window.window.after(
+            DETAIL_IMAGE_SETTLE_MS,
+            lambda: self._load_detail_images(window, self.current_selected_post),
+        )
+
+    def _cancel_detail_image_load(self, window):
+        """保留中の遅延ロードを取り消す。マウス選択など即時描画する経路の先頭で呼ぶ。"""
+        if self._detail_image_timer:
+            window.window.after_cancel(self._detail_image_timer)
+            self._detail_image_timer = None
 
     def format_post_for_list(self, post):
         # Return a row for the table: [Name, Reply To, Text, Date, RT, Like]
@@ -1707,7 +1745,7 @@ class MainWindow:
                         continue
 
                     # 長押し（オートリピート）判定: 直前の処理から間もなければ長押しで通過中とみなす
-                    is_key_held = current_time - getattr(self, '_last_space_time', 0.0) < 0.3
+                    is_key_held = current_time - getattr(self, '_last_space_time', 0.0) < SPACE_HOLD_WINDOW_SEC
 
                     # If the user is typing in a text field, ignore the shortcut UNLESS the field is empty
                     focused = window.window.focus_get()
@@ -1842,11 +1880,9 @@ class MainWindow:
                                     item_id = items[target_unread_idx]
                                     tree.selection_set(item_id)
                                     tree.see(item_id)
-                                    # 長押しで通過中かつ他に未読が残る場合は画像DLをスキップして応答性を優先
-                                    total_unread = sum(1 for t in tabs for p in t.posts if not p.is_read)
-                                    skip_image_load = is_key_held and total_unread > 1
+                                    # 長押しで通過中は画像処理をスキップし、キーが途切れてから読み込む
                                     # Update detail view manually
-                                    self._update_detail_view(window, target_tab, target_unread_idx, tabs, skip_image_load=skip_image_load)
+                                    self._update_detail_view(window, target_tab, target_unread_idx, tabs, skip_image_load=is_key_held)
                     
                     # 処理完了後に時刻を更新（ラグによる二重実行防止）
                     import time
