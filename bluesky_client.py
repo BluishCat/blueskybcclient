@@ -11,7 +11,6 @@ def global_excepthook(exctype, value, tb):
         pass
 
 sys.excepthook = global_excepthook
-import traceback
 import ctypes
 
 # Enable High DPI awareness for Windows multi-monitor setups
