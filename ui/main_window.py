@@ -19,6 +19,10 @@ from PIL import Image as PILImage, ImageTk as PILImageTk, ImageGrab
 from utils.ui_config import save_ui_state, load_ui_state
 from utils.paths import get_resource_path
 
+# 未読ジャンプのスロットル。長押しのチャタリングとキューの積み残しを抑えつつ、
+# キーリピート間隔(最速 約32ms)を無駄に待たない値。実際の送り間隔は
+# 「1投稿の処理時間 + この値をリピート間隔で切り上げた分」になる。
+SPACE_JUMP_THROTTLE_SEC = 0.05
 # 未読ジャンプ長押しの判定窓。Windowsのキーリピート開始遅延（既定 約500ms）を跨いでも
 # 「通過中」と見なせるよう余裕を持たせる。
 SPACE_HOLD_WINDOW_SEC = 0.8
@@ -1740,8 +1744,7 @@ class MainWindow:
                 if key in ("space", " ", "　", "??"):
                     import time
                     current_time = time.time()
-                    # 閾値を 0.1s に短縮（ユーザー要望、連打時の追従を速く / 長押しのチャタリングは抑止）
-                    if hasattr(self, '_last_space_time') and current_time - self._last_space_time < 0.1:
+                    if hasattr(self, '_last_space_time') and current_time - self._last_space_time < SPACE_JUMP_THROTTLE_SEC:
                         continue
 
                     # 長押し（オートリピート）判定: 直前の処理から間もなければ長押しで通過中とみなす
