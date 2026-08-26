@@ -13,10 +13,28 @@ import windnd
 from PIL import Image as PILImage, ImageTk as PILImageTk, ImageGrab
 from utils.ui_config import save_ui_state, load_ui_state
 from utils.paths import get_resource_path
+from utils.mp4 import read_video_info
 from utils.version import __version__
 
 # ウィンドウタイトルの共通部分。ログイン後の統計付きタイトルも同じ前半を使う
 APP_TITLE = f"Bluesky BC Client v{__version__}"
+
+# 動画の上限 (app.bsky.embed.video の maxSize と Bluesky 側の長さ制限)
+MAX_VIDEO_BYTES = 300 * 1000 * 1000
+MAX_VIDEO_SECONDS = 10 * 60
+
+# app.bsky.video.defs#jobStatus の state の表示名。未知の状態はそのまま表示する
+VIDEO_STATE_LABELS = {
+    "JOB_STATE_CREATED": "アップロード完了",
+    "JOB_STATE_ENCODING": "エンコード中",
+    "JOB_STATE_ENCODED": "エンコード完了",
+    "JOB_STATE_SCANNING": "検査中",
+    "JOB_STATE_SCANNED": "検査完了",
+    "JOB_STATE_UPLOADING": "保存中",
+    "JOB_STATE_UPLOADED": "保存完了",
+    "JOB_STATE_COMPLETED": "処理完了",
+    "JOB_STATE_FAILED": "処理失敗",
+}
 
 # 未読ジャンプ長押しの送り間隔。KeyPress/KeyRelease で押下状態を直接見て
 # after() で送るため、OSのキーリピート速度にもイベントキューの往復にも縛られない。
@@ -391,6 +409,7 @@ class MainWindow:
         self.current_selected_post = None
         self.current_image_idx = 0
         self.inline_post_images = [] # List of {"data": data/path, "alt": ""}
+        self.inline_post_video = None # {"path", "info", "alt"} 画像とは排他
         self.selected_image_index = 0 # Currently editing image index
         self._app_ref = app_ref
         self._avatar_queue = queue.Queue()
@@ -659,7 +678,11 @@ class MainWindow:
 
         if post.thumbnail_urls:
             # Update index display
-            idx_text = f"1 / {len(post.thumbnail_urls)}" if len(post.thumbnail_urls) > 1 else ""
+            # 動画は静止画のサムネイルしか出せないため、再生手段を添えて示す
+            if post.is_video:
+                idx_text = "🎬 動画 (ダブルクリックで再生ページを開く)"
+            else:
+                idx_text = f"1 / {len(post.thumbnail_urls)}" if len(post.thumbnail_urls) > 1 else ""
             idx_elem.update(idx_text)
 
             # Show image area if hidden
@@ -1279,7 +1302,7 @@ class MainWindow:
 
         # Bind Ctrl+Enter for Inline Post
         def submit_inline(e):
-            window.events.put(("-INLINE_POST_BTN-", {"-INLINE_POST_TEXT-": window["-INLINE_POST_TEXT-"].get(), "images": self.inline_post_images}))
+            window.events.put(("-INLINE_POST_BTN-", {"-INLINE_POST_TEXT-": window["-INLINE_POST_TEXT-"].get()}))
             return "break"
         
         try:
@@ -1318,7 +1341,7 @@ class MainWindow:
                 print(f"[DEBUG DND] files dropped: {files}", flush=True)
                 image_files = []
                 for f in files:
-                    if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.gif')):
+                    if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.gif', '.mp4')):
                         image_files.append(f)
                 
                 if image_files:
@@ -1923,9 +1946,15 @@ class MainWindow:
                     if url:
                         webbrowser.open(url)
             elif event == "-IMAGE_DOUBLE_CLICK-":
-                if self.current_selected_post and self.current_selected_post.full_image_urls:
-                    idx = min(self.current_image_idx, len(self.current_selected_post.full_image_urls) - 1)
-                    webbrowser.open(self.current_selected_post.full_image_urls[idx])
+                post = self.current_selected_post
+                if post and post.is_video:
+                    # 動画は HLS なのでアプリでは再生できない。投稿ページをブラウザで開く
+                    url = self.get_post_web_url(post)
+                    if url:
+                        webbrowser.open(url)
+                elif post and post.full_image_urls:
+                    idx = min(self.current_image_idx, len(post.full_image_urls) - 1)
+                    webbrowser.open(post.full_image_urls[idx])
             elif event == "-IMAGE_CYCLE-":
                 if self.current_selected_post and len(self.current_selected_post.thumbnail_urls) > 1:
                     data = values if isinstance(values, dict) else {}
@@ -2067,8 +2096,10 @@ class MainWindow:
                         self._update_image_status(window, "-INLINE_POST_")
                 except Exception: pass
             elif event == "-INLINE_POST_ALT_TEXT-":
-                if 0 <= self.selected_image_index < len(self.inline_post_images):
-                    new_alt = values.get("-INLINE_POST_ALT_TEXT-", "")
+                new_alt = values.get("-INLINE_POST_ALT_TEXT-", "")
+                if self.inline_post_video:
+                    self.inline_post_video["alt"] = new_alt
+                elif 0 <= self.selected_image_index < len(self.inline_post_images):
                     self.inline_post_images[self.selected_image_index]["alt"] = new_alt
             elif event == "-INLINE_POST_TEXT-":
                 # 文字数カウンターを更新 (2バイト文字も1文字としてカウント)
@@ -2086,13 +2117,16 @@ class MainWindow:
                 except Exception:
                     pass
             elif event == "-INLINE_POST_ADD_IMAGE-":
-                files = filedialog.askopenfilenames(filetypes=[("Image files", "*.jpg *.jpeg *.png *.webp *.gif")])
+                files = filedialog.askopenfilenames(filetypes=[("Image/Video files", "*.jpg *.jpeg *.png *.webp *.gif *.mp4")])
                 if files:
                     self._add_images_to_list(window, "-INLINE_POST_", list(files))
             elif event == "-INLINE_POST_CLEAR_IMAGE-":
                 self.inline_post_images = []
+                self.inline_post_video = None
                 self.selected_image_index = 0
                 self._update_image_status(window, "-INLINE_POST_")
+            elif event == "-INLINE_POST_CLOSE_PREVIEW-":
+                self._hide_inline_preview(window)
             elif isinstance(event, str) and event.startswith("-INLINE_POST_REMOVE_"):
                 try:
                     idx = int(event.split("_")[-1].strip("-"))
@@ -2109,12 +2143,32 @@ class MainWindow:
                 text = data_dict.get("-INLINE_POST_TEXT-", "")
                 # Use current state of images which now includes alt text
                 images = self.inline_post_images
+                video = self.inline_post_video
                 if text and text.strip():
                     if len(text.strip()) > 300:
                         import tkinter.messagebox as _mb
                         _mb.showwarning("文字数超過", f"300文字以内で入力してください。（現在 {len(text.strip())} 文字）", parent=window.window)
                     else:
-                        self._do_action_async(window, "ポスト", self.post_callback, text.strip(), images)
+                        # 動画はエンコード完了まで数分かかるため、UI を止めないよう別スレッドで実行する
+                        def on_video_progress(state, progress):
+                            window.events.put(("-VIDEO_PROGRESS-", {"state": state, "progress": progress}))
+
+                        threading.Thread(
+                            target=self._do_action_async,
+                            args=(window, "ポスト", self.post_callback, text.strip(), images, video, on_video_progress),
+                            daemon=True
+                        ).start()
+            elif event == "-VIDEO_PROGRESS-":
+                data_dict = values if isinstance(values, dict) else {}
+                try:
+                    state = data_dict.get("state")
+                    progress = data_dict.get("progress")
+                    label = VIDEO_STATE_LABELS.get(state, state or "")
+                    if progress:
+                        label = f"{label} {progress}%"
+                    window["-INLINE_POST_IMAGE_INFO-"].update(label)
+                except Exception:
+                    pass
             elif event == "New Post":
                 self.show_post_dialog(window)
             elif event == "Change Account":
@@ -2223,12 +2277,16 @@ class MainWindow:
             success, err = func(*args)
             if success and action_name == "ポスト":
                 window.window.after(100, lambda: self._reset_inline_post_images(window))
+            elif action_name == "ポスト":
+                # 失敗時は添付を残し、動画の進捗表示だけ元に戻す
+                window.window.after(100, lambda: self._update_image_status(window, "-INLINE_POST_"))
             window.events.put(("-ACTION_COMPLETE-", {"action": action_name, "success": success, "error": err}))
         except Exception as e:
             window.events.put(("-ACTION_COMPLETE-", {"action": action_name, "success": False, "error": str(e)}))
 
     def _reset_inline_post_images(self, window):
         self.inline_post_images = []
+        self.inline_post_video = None
         self._update_image_status(window, "-INLINE_POST_")
 
     def _do_action_bookmark_async(self, window, post):
@@ -2415,8 +2473,45 @@ class MainWindow:
         except Exception as e:
             pass
 
+    def _hide_inline_preview(self, window):
+        """プレビューのオーバーレイを畳む。添付そのものは保持する"""
+        try:
+            overlay_widget = window["-INLINE_POST_OVERLAY-"].widget
+            overlay_widget.place_forget()
+            if overlay_widget.master:
+                overlay_widget.master.place_forget()
+        except Exception: pass
+
+    def _set_post_video(self, window, prefix, path):
+        """動画を添付する。動画は1本のみで、画像とは排他"""
+        size = os.path.getsize(path)
+        if size > MAX_VIDEO_BYTES:
+            messagebox.showwarning("制限", f"動画は300MBまでです。（このファイルは {size / 1000 / 1000:.0f}MB）")
+            return
+
+        # 断片化 mp4 では長さが読めない。その場合の判定はサーバー側に任せる
+        info = read_video_info(path)
+        if info and info["duration_sec"] and info["duration_sec"] > MAX_VIDEO_SECONDS:
+            messagebox.showwarning("制限", f"動画は10分までです。（このファイルは {info['duration_sec'] / 60:.1f}分）")
+            return
+
+        video = {"path": path, "info": info, "alt": ""}
+        if prefix == "-INLINE_POST_":
+            self.inline_post_images = []
+            self.inline_post_video = video
+        else:
+            self._dialog_images = []
+            self._dialog_video = video
+        self._update_image_status(window, prefix)
+
     def _add_images_to_list(self, window, prefix, new_images):
         """画像リストに新規画像を追加しUIを更新する (new_imagesはパスのリストまたは {name, data}のリスト)"""
+        # Bluesky は画像と動画を同時に添付できないため、動画が来たら動画添付に切り替える
+        videos = [f for f in new_images if isinstance(f, str) and f.lower().endswith(".mp4")]
+        if videos:
+            self._set_post_video(window, prefix, videos[0])
+            return
+
         current_images = self.inline_post_images if prefix == "-INLINE_POST_" else getattr(self, "_dialog_images", [])
         
         print(f"[DEBUG DND] adding images to list: {new_images}", flush=True)
@@ -2431,12 +2526,14 @@ class MainWindow:
             
         if prefix == "-INLINE_POST_":
             self.inline_post_images = current_images
+            self.inline_post_video = None
             # Default to selecting the newly added image if it's the first one or just added
             if len(current_images) > 0:
                 self.selected_image_index = len(current_images) - 1
             self._update_image_status(window, "-INLINE_POST_")
         else:
             self._dialog_images = current_images
+            self._dialog_video = None
             # ダイアログ側の更新はダイアログ表示中のため別途考慮が必要
             if hasattr(self, "_active_dialog_window"):
                 self._update_image_status(self._active_dialog_window, "-")
@@ -2445,6 +2542,7 @@ class MainWindow:
         """画像選択状態のUI表示を更新する"""
         is_inline = (key_prefix == "-INLINE_POST_")
         images = self.inline_post_images if is_inline else getattr(self, "_dialog_images", [])
+        video = self.inline_post_video if is_inline else getattr(self, "_dialog_video", None)
         count = len(images)
         
         info_key = f"{key_prefix}IMAGE_INFO-"
@@ -2498,7 +2596,7 @@ class MainWindow:
             alt_text_key = "-INLINE_POST_ALT_TEXT-"
             
             overlay_elem = window[overlay_key]
-            if count > 0:
+            if count > 0 or video:
                 # Use place to overlay on top of the list area
                 # Target: covering Right part of the main paned window (timeline)
                 try:
@@ -2521,6 +2619,13 @@ class MainWindow:
                         master_frame.update_idletasks()
                 except Exception: pass
                 
+                # 動画はサムネイルを作れないため、プレビュー画像を消して ALT だけ編集させる
+                if video:
+                    try:
+                        window[big_preview_key].erase()
+                        window[alt_text_key].update(video["alt"])
+                    except Exception: pass
+
                 # 選択中の画像を大きく表示
                 try:
                     current_idx = min(self.selected_image_index, count - 1)
@@ -2542,12 +2647,7 @@ class MainWindow:
                     window[alt_text_key].update(selected_img.get("alt", ""))
                 except Exception: pass
             else:
-                # Hide overlay
-                try:
-                    overlay_elem.widget.place_forget()
-                    if overlay_elem.widget.master:
-                        overlay_elem.widget.master.place_forget()
-                except Exception: pass
+                self._hide_inline_preview(window)
         
         # 行全体の表示・非表示を切り替え (余白をなくすため)
         try:
@@ -2565,7 +2665,7 @@ class MainWindow:
                 if h > 150:
                     # Provide an ideal ratio, but guarantee at least 120px for the bottom 'New Post' area
                     # so that the multiline text input and buttons are never crushed out of existence.
-                    target_ratio = 0.6 if count > 0 else 0.8
+                    target_ratio = 0.6 if (count > 0 or video) else 0.8
                     pos = int(h * target_ratio)
                     if (h - pos) < 120:
                         pos = h - 120
@@ -2576,8 +2676,9 @@ class MainWindow:
         
         # テキスト情報と一括クリアボタンの更新
         try:
-            window[info_key].update(f"{count}枚")
-            _set_elem_visible(window[clear_key], count > 0)
+            label = f"🎬 {os.path.basename(video['path'])}" if video else f"{count}枚"
+            window[info_key].update(label)
+            _set_elem_visible(window[clear_key], count > 0 or bool(video))
         except Exception: pass
 
     def show_post_dialog(self, parent_window):
@@ -2588,6 +2689,7 @@ class MainWindow:
             pass
         
         self._dialog_images = []
+        self._dialog_video = None
         
         layout = [
             [eg.Text("今なに考えてる？")],
@@ -2637,7 +2739,7 @@ class MainWindow:
         def on_drop_dialog(files):
             image_files = []
             for f in files:
-                if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.gif')):
+                if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.gif', '.mp4')):
                     image_files.append(f)
             if image_files:
                 self._add_images_to_list(window, "-", image_files)
@@ -2650,12 +2752,13 @@ class MainWindow:
                 break
             
             if event == "-ADD_IMAGE-":
-                files = filedialog.askopenfilenames(filetypes=[("Image files", "*.jpg *.jpeg *.png *.webp *.gif")])
+                files = filedialog.askopenfilenames(filetypes=[("Image/Video files", "*.jpg *.jpeg *.png *.webp *.gif *.mp4")])
                 if files:
                     self._add_images_to_list(window, "-", list(files))
             
             if event == "-CLEAR_IMAGE-":
                 self._dialog_images = []
+                self._dialog_video = None
                 self._update_image_status(window, "-")
                 
             if isinstance(event, str) and event.startswith("-DIAL_REMOVE_"):
@@ -2671,10 +2774,10 @@ class MainWindow:
                 data_dict = values if isinstance(values, dict) else {}
                 text = data_dict.get("-TEXT-")
                 if text and text.strip():
-                    parent_window.events.put(("-INLINE_POST_BTN-", {
-                        "-INLINE_POST_TEXT-": text.strip(),
-                        "images": self._dialog_images
-                    }))
+                    # 投稿はインライン側のハンドラが処理するため、添付もそちらへ引き渡す
+                    self.inline_post_images = self._dialog_images
+                    self.inline_post_video = self._dialog_video
+                    parent_window.events.put(("-INLINE_POST_BTN-", {"-INLINE_POST_TEXT-": text.strip()}))
                 break
         
         window.close()
