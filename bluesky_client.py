@@ -52,7 +52,10 @@ class BlueskyApp:
     def handle_login(self, username, password):
         return self.api.login(username, password)
 
-    def handle_post(self, text, images=None):
+    def handle_post(self, text, images=None, video=None, on_progress=None):
+        # Bluesky は画像と動画を同時に添付できないため、動画があれば動画として扱う
+        if video:
+            return self._post_video(text, video, on_progress)
         if images:
             images_bytes = []
             image_alts = []
@@ -71,6 +74,25 @@ class BlueskyApp:
                     pass; # print(f"Failed to load image: {e}")
             return self.api.send_post_with_images(text, images_bytes, image_alts=image_alts)
         return self.api.send_post(text)
+
+    def _post_video(self, text, video, on_progress):
+        """動画添付ポスト。video は UI が組み立てた {"path", "info", "alt"}"""
+        path = video["path"]
+        with open(path, "rb") as f:
+            video_bytes = f.read()
+
+        # info は添付時に解析済み。読めなかった場合は aspectRatio を省いて投稿する
+        info = video["info"]
+        aspect_ratio = (info["width"], info["height"]) if info else None
+
+        return self.api.send_post_with_video(
+            text,
+            video_bytes,
+            os.path.basename(path),
+            alt=video["alt"],
+            aspect_ratio=aspect_ratio,
+            on_progress=on_progress,
+        )
 
     def handle_repost(self, post):
         return self.api.repost_post(post.uri, post.cid)
