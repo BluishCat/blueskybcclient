@@ -29,7 +29,7 @@ def format_bluesky_date(date_str):
         return date_str
 
 class Post:
-    def __init__(self, author_handle, author_display_name, text, created_at, uri=None, cid=None, reply_to=None, thumbnail_urls=None, full_image_urls=None, repost_count=0, like_count=0, avatar_url=None, reply_parent_author=None, reply_parent_handle=None, reply_parent_text=None, quote_author=None, quote_handle=None, quote_text=None, is_repost=False, reposted_by_author=None, reposted_by_handle=None, is_follower=False):
+    def __init__(self, author_handle, author_display_name, text, created_at, uri=None, cid=None, reply_to=None, thumbnail_urls=None, full_image_urls=None, repost_count=0, like_count=0, avatar_url=None, reply_parent_author=None, reply_parent_handle=None, reply_parent_text=None, quote_author=None, quote_handle=None, quote_text=None, is_repost=False, reposted_by_author=None, reposted_by_handle=None, is_follower=False, is_video=False):
         self.author_handle = author_handle
         self.author_display_name = author_display_name or author_handle
         self.text = text
@@ -43,6 +43,7 @@ class Post:
         self.reposted_by_handle = reposted_by_handle
         self.thumbnail_urls = thumbnail_urls or []
         self.full_image_urls = full_image_urls or []
+        self.is_video = is_video
         self.repost_count = repost_count or 0
         self.like_count = like_count or 0
         self.avatar_url = avatar_url
@@ -104,6 +105,7 @@ class Post:
         # Extract thumbnail and full image if any
         thumbnail_urls = []
         full_image_urls = []
+        is_video = False
         quote_author = None
         quote_handle = None
         quote_text = None
@@ -138,21 +140,30 @@ class Post:
                         quote_handle = view_rec.author.handle
                         quote_author = view_rec.author.display_name or view_rec.author.handle
 
+            # 引用付き投稿 (recordWithMedia) では画像・動画は embed.media 側にぶら下がる
+            media = getattr(post.embed, 'media', post.embed)
+
             # Check for images
             # models.AppBskyEmbedImages.View
-            if hasattr(post.embed, 'images') and post.embed.images:
-                for img in post.embed.images:
+            if hasattr(media, 'images') and media.images:
+                for img in media.images:
                     if img.thumb:
                         thumbnail_urls.append(img.thumb)
                     if img.fullsize:
                         full_image_urls.append(img.fullsize)
+            # 動画 (app.bsky.embed.video#view) の実体は HLS のため再生できない。
+            # サムネイルの静止画だけを表示し、再生はブラウザの投稿ページに任せる
+            elif hasattr(media, 'playlist'):
+                is_video = True
+                if media.thumbnail:
+                    thumbnail_urls.append(media.thumbnail)
             # Check for external (link preview)
-            elif hasattr(post.embed, 'external') and hasattr(post.embed.external, 'thumb'):
-                thumb = post.embed.external.thumb
+            elif hasattr(media, 'external') and hasattr(media.external, 'thumb'):
+                thumb = media.external.thumb
                 if thumb:
                     thumbnail_urls.append(thumb)
-                    if hasattr(post.embed.external, 'uri') and post.embed.external.uri:
-                        full_image_urls.append(post.embed.external.uri)
+                    if hasattr(media.external, 'uri') and media.external.uri:
+                        full_image_urls.append(media.external.uri)
                 
         avatar_url = getattr(author, 'avatar', None)
         return cls(
@@ -176,7 +187,8 @@ class Post:
             quote_author=quote_author,
             quote_handle=quote_handle,
             quote_text=quote_text,
-            is_follower=is_follower
+            is_follower=is_follower,
+            is_video=is_video
         )
 
     @classmethod
