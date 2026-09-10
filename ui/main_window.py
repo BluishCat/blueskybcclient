@@ -255,7 +255,6 @@ class CustomTable(eg.Element):
         
         # Inner frame to hold tree and vertical scrollbar above the horizontal scrollbar
         tree_frame = ttk.Frame(container)
-        tree_frame.pack(side="top", fill="both", expand=True)
         
         columns = self.headings
         self._tree = ttk.Treeview(tree_frame, columns=columns, show="tree headings", selectmode="browse")
@@ -266,9 +265,13 @@ class CustomTable(eg.Element):
         self._tree.configure(yscrollcommand=self.vsb.set, xscrollcommand=self.hsb.set)
         
         # Layout
-        self._tree.pack(side="left", fill="both", expand=True, padx=0, pady=0)
-        self.vsb.pack(side="right", fill="y", padx=0, pady=0)
+        # pack は先に配置したウィジェットから領域を割り当てるため、ツリーを先に pack すると
+        # 列幅の合計が表示幅を超えたときスクロールバーの取り分が 0 になって消えてしまう。
+        # スクロールバー → ツリーの順に pack して、常にスクロールバーの幅を確保する。
         self.hsb.pack(side="bottom", fill="x", padx=0, pady=0)
+        tree_frame.pack(side="top", fill="both", expand=True)
+        self.vsb.pack(side="right", fill="y", padx=0, pady=0)
+        self._tree.pack(side="left", fill="both", expand=True, padx=0, pady=0)
         
         # Configure #0 column (tree column) for icons
         # Approximate size for 18px icon with no padding
