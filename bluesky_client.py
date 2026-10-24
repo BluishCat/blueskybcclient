@@ -26,7 +26,8 @@ from api.bluesky_api import BlueskyClientWrapper
 from models.post import Post
 from models.tab import TimelineTabModel
 from utils.ui_config import save_ui_state, load_ui_state
-from utils.encryption import encrypt_password, decrypt_password
+from utils.encryption import decrypt_password  # legacy config.json migration only
+from utils import credentials
 from utils.paths import get_resource_path, get_app_dir
 from ui.main_window import MainWindow
 
@@ -227,29 +228,47 @@ class BlueskyApp:
             
         return self.tabs
 
+    def _config_path(self):
+        return os.path.join(get_app_dir(), "config.json")
+
+    def _write_config(self, data):
+        import json
+        try:
+            with open(self._config_path(), "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
     def load_config(self):
         import json
-        config_path = os.path.join(get_app_dir(), "config.json")
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
+            with open(self._config_path(), "r", encoding="utf-8") as f:
                 data = json.load(f)
-                if "password" in data and data["password"]:
-                    data["password"] = decrypt_password(data["password"])
-                return data
         except Exception:
             return {}
+        username = data.get("username", "")
+
+        # Legacy format: XOR-obfuscated password stored in config.json.
+        # Move it into Credential Manager and strip it from the file.
+        legacy = data.pop("password", None)
+        if legacy:
+            legacy_plain = decrypt_password(legacy)
+            if credentials.set_password(username, legacy_plain):
+                self._write_config(data)
+            data["password"] = legacy_plain
+            return data
+
+        data["password"] = credentials.get_password(username)
+        return data
 
     def save_config(self, username, password):
-        import json
-        config_path = os.path.join(get_app_dir(), "config.json")
-        try:
-            with open(config_path, "w", encoding="utf-8") as f:
-                json.dump({"username": username, "password": encrypt_password(password)}, f)
-        except Exception as e:
-            pass; # print(f"Failed to save config: {e}")
+        credentials.set_password(username, password)
+        self._write_config({"username": username})
 
     def clear_config(self):
-        config_path = os.path.join(get_app_dir(), "config.json")
+        username = self.load_config().get("username", "")
+        credentials.delete_password(username)
+        config_path = self._config_path()
         if os.path.exists(config_path):
             try:
                 os.remove(config_path)
