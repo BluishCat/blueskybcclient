@@ -38,7 +38,8 @@ hiddenimports = [
     'atproto', 'atproto_client', 'pydantic', 'pydantic_core', 'typing_extensions',
     'atproto_client.client', 'atproto_client.client.client',
     'atproto_crypto', 'atproto_identity', 'atproto_lexicon', 'atproto_server', 
-    'atproto_codegen', 'atproto_common', 'libipld', 'requests', 'windnd'
+    'atproto_codegen', 'atproto_common', 'libipld', 'requests', 'windnd',
+    'keyring', 'keyring.backends.Windows', 'win32ctypes', 'win32ctypes.pywin32'
 ]
 
 # Collection loop

@@ -1,0 +1,9 @@
+atproto>=0.0.73
+pillow>=13.0.0
+requests>=2.34.2
+urllib3>=2.8.0
+keyring>=25.7.0
+TkEasyGUI>=1.0.41
+pygame>=2.6.1
+windnd>=1.0.7
+pyinstaller>=6.19.0

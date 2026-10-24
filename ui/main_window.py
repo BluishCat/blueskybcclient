@@ -49,6 +49,27 @@ DETAIL_RENDER_SETTLE_MS = 250
 # Windows Tkinter は全角スペースやIME経由のキーに '??' を返すことがある。
 SPACE_KEYSYMS = ("space", " ", "　", "??")
 
+
+def open_url_safely(url) -> bool:
+    """Open only http(s) URLs in the browser.
+
+    URLs from posts are attacker-controlled. On Windows webbrowser.open() falls
+    back to os.startfile(), so file://, UNC paths or custom schemes could launch
+    local programs or leak NTLM credentials.
+    """
+    from urllib.parse import urlsplit
+    if not isinstance(url, str):
+        return False
+    url = url.strip()
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    if parts.scheme.lower() not in ("http", "https") or not parts.netloc:
+        return False
+    webbrowser.open(url)
+    return True
+
 # --- TkEasyGUI compatibility fix for version 1.0.40 ---
 # TkEasyGUI's _widget_update() stores all kwargs (including `visible`) into
 # self.props. When that element object is later used to create a widget,
@@ -1526,8 +1547,7 @@ class MainWindow:
                     for i in range(0, len(ranges), 2):
                         if text_widget.compare(ranges[i], "<=", index) and text_widget.compare(index, "<=", ranges[i+1]):
                             url = text_widget.get(ranges[i], ranges[i+1])
-                            import webbrowser
-                            webbrowser.open(url)
+                            open_url_safely(url)
                             break
             except Exception as e:
                 pass; # print(f"URL click error: {e}")
@@ -1947,17 +1967,17 @@ class MainWindow:
                 if self.current_selected_post:
                     url = self.get_post_web_url(self.current_selected_post)
                     if url:
-                        webbrowser.open(url)
+                        open_url_safely(url)
             elif event == "-IMAGE_DOUBLE_CLICK-":
                 post = self.current_selected_post
                 if post and post.is_video:
                     # 動画は HLS なのでアプリでは再生できない。投稿ページをブラウザで開く
                     url = self.get_post_web_url(post)
                     if url:
-                        webbrowser.open(url)
+                        open_url_safely(url)
                 elif post and post.full_image_urls:
                     idx = min(self.current_image_idx, len(post.full_image_urls) - 1)
-                    webbrowser.open(post.full_image_urls[idx])
+                    open_url_safely(post.full_image_urls[idx])
             elif event == "-IMAGE_CYCLE-":
                 if self.current_selected_post and len(self.current_selected_post.thumbnail_urls) > 1:
                     data = values if isinstance(values, dict) else {}
