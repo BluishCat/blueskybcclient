@@ -19,3 +19,6 @@ __pycache__/
 /config.json
 /ui_config.json
 *.log
+*.pyc
+.fake
+
