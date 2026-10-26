@@ -5,7 +5,9 @@ plain or reversible form.
 """
 import keyring
 
-SERVICE_NAME = "BlueskyBCClient"
+SERVICE_NAME = "Poisora"
+# 改名前の資格情報名。見つかったら SERVICE_NAME へ移す
+LEGACY_SERVICE_NAMES = ("BlueskyBCClient",)
 
 _backend_ready = False
 
@@ -28,9 +30,30 @@ def get_password(username: str):
         return None
     _ensure_backend()
     try:
-        return keyring.get_password(SERVICE_NAME, username)
+        password = keyring.get_password(SERVICE_NAME, username)
     except Exception:
         return None
+    if password:
+        return password
+    return _migrate_legacy(username)
+
+
+def _migrate_legacy(username: str):
+    """旧名で保存されたパスワードを新しい名前へ移し、そのパスワードを返す"""
+    for legacy in LEGACY_SERVICE_NAMES:
+        try:
+            password = keyring.get_password(legacy, username)
+        except Exception:
+            continue
+        if not password:
+            continue
+        try:
+            keyring.set_password(SERVICE_NAME, username, password)
+            keyring.delete_password(legacy, username)
+        except Exception:
+            pass  # 移せなくても今回のログインには使える
+        return password
+    return None
 
 
 def set_password(username: str, password: str) -> bool:
@@ -48,7 +71,8 @@ def delete_password(username: str) -> None:
     if not username:
         return
     _ensure_backend()
-    try:
-        keyring.delete_password(SERVICE_NAME, username)
-    except Exception:
-        pass
+    for service in (SERVICE_NAME, *LEGACY_SERVICE_NAMES):
+        try:
+            keyring.delete_password(service, username)
+        except Exception:
+            pass

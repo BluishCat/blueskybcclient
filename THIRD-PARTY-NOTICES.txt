@@ -1,13 +1,13 @@
 ﻿================================================================================
  THIRD-PARTY NOTICES
- Bluesky BC Client (TweenBS) v0.3.0
+ Poisora v0.3.0
 ================================================================================
 
-同梱の BlueskyBCClient.exe には、以下の第三者ソフトウェアが含まれています。
+同梱の Poisora.exe には、以下の第三者ソフトウェアが含まれています。
 各ソフトウェアの著作権はそれぞれの権利者に帰属し、以下に示すライセンス条件の
 もとで配布されています。
 
-TweenBS 本体のライセンスは、同梱の LICENSE.txt (MIT License) を参照してください。
+Poisora 本体のライセンスは、同梱の LICENSE.txt (MIT License) を参照してください。
 
 本ファイルの「1. Python パッケージ」の一覧および全文は、ビルド時に exe へ実際に
 取り込まれた構成物 (PyInstaller の PKG/Analysis TOC) から機械的に抽出したものです。
@@ -24,7 +24,7 @@ pygame は GNU Lesser General Public License version 2.1 (LGPL-2.1) のもとで
 pygame およびそれが利用する SDL2 は、単一 exe の内部に格納されたうえで実行時に
 一時ディレクトリへ展開され、動的リンクによって読み込まれます。pygame を差し替えた
 版を利用したい場合は、下記の配布元から pygame を入手し、本ソフトウェアのソース
-コード (https://github.com/BluishCat/blueskybcclient) からビルドしてください。
+コード (https://github.com/BluishCat/poisora) からビルドしてください。
 
   pygame 配布元: https://www.pygame.org/  /  https://github.com/pygame/pygame
 
