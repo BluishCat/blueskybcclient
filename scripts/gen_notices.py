@@ -3,11 +3,11 @@
 Run from the repository root with the project's venv python (so that
 importlib.metadata sees the distributions that were bundled), after building:
 
-    .venv\\Scripts\\python.exe -m PyInstaller TweenBS.spec --noconfirm
+    .venv\\Scripts\\python.exe -m PyInstaller Poisora.spec --noconfirm
     .venv\\Scripts\\python.exe scripts\\gen_notices.py
 
 - Section 1/3 (Python packages and their license texts) are rebuilt from the
-  modules actually listed in build/TweenBS/PYZ-00.toc and PKG-00.toc.
+  modules actually listed in build/Poisora/PYZ-00.toc and PKG-00.toc.
 - The header, section 2 (runtime / native libraries), curated license labels
   and license texts for packages that ship none (e.g. pygame) are carried over
   from the previous THIRD-PARTY-NOTICES.txt, so edit that file by hand when
@@ -23,7 +23,7 @@ from utils.version import __version__  # noqa: E402
 
 ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
 ap.add_argument("--previous", default=str(ROOT / "THIRD-PARTY-NOTICES.txt"))
-ap.add_argument("--toc-dir", default=str(ROOT / "build" / "TweenBS"))
+ap.add_argument("--toc-dir", default=str(ROOT / "build" / "Poisora"))
 ap.add_argument("--version", default=__version__)
 ap.add_argument("--out", default=str(ROOT / "THIRD-PARTY-NOTICES.txt"))
 args = ap.parse_args()
@@ -107,7 +107,7 @@ ordered = sorted(dists.values(), key=lambda d: d.metadata["Name"].lower())
 
 # --- header + section 2 copied from previous notices -----------------------
 head, rest = old.split("\n================================================================================\n 1. Python パッケージ", 1)
-head = re.sub(r"Bluesky BC Client \(TweenBS\) v[0-9.]+", f"Bluesky BC Client (TweenBS) v{version}", head)
+head = re.sub(r"^ Poisora v[0-9.]+$", f" Poisora v{version}", head, count=1, flags=re.M)
 sec2 = "================================================================================\n 2." + rest.split("\n================================================================================\n 2.", 1)[1]
 sec2 = sec2.split("\n================================================================================\n 3.", 1)[0]
 

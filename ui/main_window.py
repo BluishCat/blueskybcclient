@@ -17,7 +17,7 @@ from utils.version import __version__
 from utils.platform_compat import bind_accel, bind_right_click, hook_dropfiles
 
 # ウィンドウタイトルの共通部分。ログイン後の統計付きタイトルも同じ前半を使う
-APP_TITLE = f"Bluesky BC Client v{__version__}"
+APP_TITLE = f"Poisora v{__version__}"
 
 # 動画の上限 (app.bsky.embed.video の maxSize と Bluesky 側の長さ制限)
 MAX_VIDEO_BYTES = 300 * 1000 * 1000
@@ -485,7 +485,7 @@ class MainWindow:
             [eg.Input(key="-PASSWORD-", password_char="*")],
             [eg.Button("ログイン"), eg.Button("キャンセル")]
         ]
-        window = eg.Window("Blueskyログイン", layout)
+        window = eg.Window("Poisora - Blueskyログイン", layout)
 
         while True:
             event, values = window.read()
