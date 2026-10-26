@@ -79,7 +79,7 @@ pip install -r requirements.txt
 python bluesky_client.py
 ```
 
-同じ環境で `pyinstaller TweenBS.spec` を実行すると、その OS 用の実行ファイルも作れます。
+同じ環境で `pyinstaller TweenBS.spec` を実行すると、その OS 用の実行ファイルを作れる可能性があります（未確認）。
 
 Windows 版との違い:
 
