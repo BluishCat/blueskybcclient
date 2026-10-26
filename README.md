@@ -63,3 +63,26 @@ Blueskyのデスクトップ向けクライアントアプリケーションで�
 本アプリケーションはレジストリ等を使用していません。
 不要になった場合は、先にメニューの「アカウント」＞「アカウント切り替え」を選んで資格情報マネージャーに保存したパスワードを削除し、ログイン画面を閉じてからアプリのフォルダ（`BlueskyBCClient.exe` や `config.json` 等が含まれているフォルダ）ごと削除してください。
 「アカウント切り替え」をせずにフォルダを削除した場合は、「コントロール パネル」＞「資格情報マネージャー」＞「Windows 資格情報」の「汎用資格情報」から `BlueskyBCClient` を削除してください。
+
+---
+
+## macOS / Linux で使う（非公式・動作未確認）
+
+配布している `BlueskyBCClient.exe` は Windows 専用です。macOS / Linux 向けの実行ファイルは配布していませんが、ソースコードは他の OS でも動くように書いてあります。ただし作者は Windows 以外で動作確認をしていないため、サポート対象外です。
+
+ソースから起動する場合（Python 3.10 以降、Tkinter 付き）:
+
+```sh
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python bluesky_client.py
+```
+
+同じ環境で `pyinstaller TweenBS.spec` を実行すると、その OS 用の実行ファイルも作れます。
+
+Windows 版との違い:
+
+*   **パスワードの保存先:** macOS はキーチェーン、Linux は Secret Service（GNOME Keyring / KWallet など）に保存されます。
+*   **ショートカット:** macOS では `Ctrl` の代わりに `Cmd` も使えます（`Cmd+V`、`Cmd+Enter`）。右クリックできない環境では `Control+クリック` を使ってください。
+*   **画像の貼り付け（Linux）:** クリップボードから画像を貼り付けるには `xclip`（X11）または `wl-clipboard`（Wayland）が必要です。

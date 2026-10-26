@@ -9,12 +9,12 @@ import threading
 import webbrowser
 import queue
 from collections import OrderedDict
-import windnd
 from PIL import Image as PILImage, ImageTk as PILImageTk, ImageGrab
 from utils.ui_config import save_ui_state, load_ui_state
 from utils.paths import get_resource_path
 from utils.mp4 import read_video_info
 from utils.version import __version__
+from utils.platform_compat import bind_accel, bind_right_click, hook_dropfiles
 
 # ウィンドウタイトルの共通部分。ログイン後の統計付きタイトルも同じ前半を使う
 APP_TITLE = f"Bluesky BC Client v{__version__}"
@@ -1331,13 +1331,13 @@ class MainWindow:
         
         try:
             widget = window["-INLINE_POST_TEXT-"].widget
-            widget.bind("<Control-Return>", submit_inline)
+            bind_accel(widget, "Return", submit_inline)
             
             # クリップボードからの貼り付け (Ctrl+V)
             def handle_paste(e):
                 self._handle_clipboard_image(window, "-INLINE_POST_")
                 # テキストの貼り付けはデフォルト処理に任せるため "break" は返さない
-            widget.bind("<Control-v>", handle_paste)
+            bind_accel(widget, "v", handle_paste)
 
             # 文字数カウンターのリアルタイム更新 (KeyRelease で直接バインド)
             def _update_char_count(e=None):
@@ -1358,9 +1358,9 @@ class MainWindow:
             def handle_paste(e):
                 self._handle_clipboard_image(window, "-INLINE_POST_")
                 widget.after(50, _update_char_count)
-            widget.bind("<Control-v>", handle_paste)
+            bind_accel(widget, "v", handle_paste)
             
-            # Drag & Drop の設定 (windnd)
+            # Drag & Drop の設定 (tkdnd)
             def on_drop(files):
                 print(f"[DEBUG DND] files dropped: {files}", flush=True)
                 image_files = []
@@ -1371,9 +1371,9 @@ class MainWindow:
                 if image_files:
                     self._add_images_to_list(window, "-INLINE_POST_", image_files)
 
-            windnd.hook_dropfiles(window.window, on_drop, force_unicode=True)
+            hook_dropfiles(window.window, on_drop)
             # 入力欄にも直接フック (重要: 他のペインに遮られないようにするため)
-            windnd.hook_dropfiles(window["-INLINE_POST_TEXT-"].widget, on_drop, force_unicode=True)
+            hook_dropfiles(window["-INLINE_POST_TEXT-"].widget, on_drop)
             
         except Exception as e:
             pass
@@ -1507,7 +1507,7 @@ class MainWindow:
                                 pass
                     return on_right_click
                 
-                table_elem.widget.bind("<Button-3>", make_rc_handler(tab))
+                bind_right_click(table_elem.widget, make_rc_handler(tab))
 
                 def make_select_handler(tab_key=tab.tab_key):
                     def handler(e):
@@ -1533,7 +1533,7 @@ class MainWindow:
             elem = window[k]
             if elem and hasattr(elem, "widget"):
                 elem.widget.bind("<Double-Button-1>", lambda e: window.dispatch_event("-TABLE_DOUBLE_CLICK-"))
-                elem.widget.bind("<Button-3>", lambda e: self.show_detail_context_menu(window, e.x_root, e.y_root))
+                bind_right_click(elem.widget, lambda e: self.show_detail_context_menu(window, e.x_root, e.y_root))
 
         text_widget = window["-DETAIL_TEXT-"].widget
         text_widget.tag_configure("url", foreground="blue", underline=True)
@@ -1562,7 +1562,7 @@ class MainWindow:
             def on_right_click(e):
                 pass; # print(f"Right click triggered at {e.x}, {e.y}")
                 window.dispatch_event("-TAB_RIGHT_CLICK-", {"x": e.x, "y": e.y, "root_x": e.x_root, "root_y": e.y_root})
-            tab_group.widget.bind("<Button-3>", on_right_click)
+            bind_right_click(tab_group.widget, on_right_click)
 
         # Apply complex UI state (sash, columns, window position) if saved
         if any(k in self.ui_settings for k in ["main_sash_pos", "detail_sash_pos", "right_sash_pos", "main_sash_ratio", "detail_sash_ratio", "right_sash_ratio", "inline_post_sash_ratio", "column_widths", "window_pos"]):
@@ -2755,8 +2755,8 @@ class MainWindow:
             self._handle_clipboard_image(window, "-")
             
         widget = window["-TEXT-"].widget
-        widget.after(100, lambda: widget.bind("<Control-Return>", submit_post))
-        widget.after(100, lambda: widget.bind("<Control-v>", handle_paste))
+        widget.after(100, lambda: bind_accel(widget, "Return", submit_post))
+        widget.after(100, lambda: bind_accel(widget, "v", handle_paste))
         
         # D&D for dialog
         def on_drop_dialog(files):
@@ -2767,7 +2767,7 @@ class MainWindow:
             if image_files:
                 self._add_images_to_list(window, "-", image_files)
         
-        windnd.hook_dropfiles(window.window, on_drop_dialog, force_unicode=True)
+        hook_dropfiles(window.window, on_drop_dialog)
 
         while True:
             event, values = window.read()
