@@ -172,6 +172,7 @@ class Post:
             text=text,
             created_at=created_at,
             uri=post.uri,
+            cid=post.cid,
             reply_to=reply_to,
             thumbnail_urls=thumbnail_urls,
             full_image_urls=full_image_urls,
@@ -209,12 +210,18 @@ class Post:
             text=text,
             created_at=created_at,
             uri=notification.uri,
+            cid=notification.cid,
             reply_to=None,
             thumbnail_urls=[],
             full_image_urls=[],
             avatar_url=getattr(author, 'avatar', None),
             is_follower=is_follower
         )
+
+    @property
+    def is_post(self):
+        """返信できる実体のポストか。いいね・リポスト・フォロー通知の URI はポストではない"""
+        return bool(self.uri) and "/app.bsky.feed.post/" in self.uri
 
     def __str__(self):
         return f"{self.author_display_name} (@{self.author_handle})\n{self.text}\n{self.created_at}"

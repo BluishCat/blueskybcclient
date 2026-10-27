@@ -19,6 +19,12 @@ class BlueskyClientWrapper:
         self.is_logged_in = False
         self.username = None
 
+    @property
+    def did(self):
+        """ログイン中アカウントの DID。ポストの URI は at://<DID>/... なので持ち主の判定に使う"""
+        me = getattr(self.client, "me", None)
+        return me.did if self.is_logged_in and me else None
+
     def login(self, handle, password):
         try:
             profile = self.client.login(handle, password)
@@ -128,33 +134,36 @@ class BlueskyClientWrapper:
             pass; # print(f"Error fetching feed {feed_uri}: {e}")
             return []
 
-    def send_post(self, text):
+    def send_post(self, text, reply_to_uri=None):
+        """テキストのみのポスト。reply_to_uri を渡すとそのポストへの返信になる"""
         if not self.is_logged_in:
             return False, "Not logged in"
         
         try:
-            self.client.send_post(text)
+            reply_to = self._build_reply_ref(reply_to_uri) if reply_to_uri else None
+            self.client.send_post(text, reply_to=reply_to)
             return True, None
         except Exception as e:
             return False, str(e)
 
-    def send_post_with_images(self, text, images_bytes, image_alts=None):
+    def send_post_with_images(self, text, images_bytes, image_alts=None, reply_to_uri=None):
         if not self.is_logged_in:
             return False, "Not logged in"
             
         if not images_bytes:
-            return self.send_post(text)
+            return self.send_post(text, reply_to_uri=reply_to_uri)
             
         if not image_alts:
             image_alts = [""] * len(images_bytes)
             
         try:
-            self.client.send_images(text=text, images=images_bytes, image_alts=image_alts)
+            reply_to = self._build_reply_ref(reply_to_uri) if reply_to_uri else None
+            self.client.send_images(text=text, images=images_bytes, image_alts=image_alts, reply_to=reply_to)
             return True, None
         except Exception as e:
             return False, str(e)
 
-    def send_post_with_video(self, text, video_bytes, filename, alt="", aspect_ratio=None, on_progress=None):
+    def send_post_with_video(self, text, video_bytes, filename, alt="", aspect_ratio=None, on_progress=None, reply_to_uri=None):
         """動画を添付して投稿する。Returns (success, error_msg)
 
         aspect_ratio は (width, height)。取得できなかった場合は None を渡せば embed から省かれる。
@@ -166,6 +175,8 @@ class BlueskyClientWrapper:
         on_progress = on_progress or (lambda state, progress: None)
 
         try:
+            # 返信先が消えていた場合に数分かかるエンコードを無駄にしないよう、先に確かめる
+            reply_to = self._build_reply_ref(reply_to_uri) if reply_to_uri else None
             blob = self._upload_video(video_bytes, filename, on_progress)
 
             embed = models.AppBskyEmbedVideo.Main(video=blob, alt=alt)
@@ -174,10 +185,34 @@ class BlueskyClientWrapper:
                     width=aspect_ratio[0], height=aspect_ratio[1]
                 )
 
-            self.client.send_post(text, embed=embed)
+            self.client.send_post(text, reply_to=reply_to, embed=embed)
             return True, None
         except Exception as e:
             return False, str(e)
+
+    def _build_reply_ref(self, parent_uri):
+        """返信先ポストの URI から ReplyRef（parent と root の組）を組み立てる
+
+        root にはスレッド先頭のポストを指定する必要がある。親自体が返信なら親のレコードに
+        記録されている root を引き継ぎ、そうでなければ親がそのまま root になる。
+        cid はタイムライン取得時の値を使わず送信直前に取り直す（編集・削除に追従するため）。
+        """
+        response = self.client.app.bsky.feed.get_posts({"uris": [parent_uri]})
+        if not response.posts:
+            raise RuntimeError("返信先のポストが見つかりません（削除された可能性があります）")
+
+        parent_view = response.posts[0]
+        parent_ref = models.create_strong_ref(parent_view)
+
+        record = parent_view.record
+        parent_reply = record.get("reply") if isinstance(record, dict) else getattr(record, "reply", None)
+        if parent_reply:
+            root = parent_reply["root"] if isinstance(parent_reply, dict) else parent_reply.root
+            root_ref = models.ComAtprotoRepoStrongRef.Main.model_validate(root)
+        else:
+            root_ref = parent_ref
+
+        return models.AppBskyFeedPost.ReplyRef(parent=parent_ref, root=root_ref)
 
     def _upload_video(self, video_bytes, filename, on_progress):
         """動画サービスに動画を渡し、エンコード完了後の BlobRef を返す"""
@@ -237,6 +272,17 @@ class BlueskyClientWrapper:
             return job
 
         raise RuntimeError(body.get("message") or body.get("error") or f"HTTP {response.status_code}")
+
+    def delete_post(self, uri):
+        """自分のポストを削除する。Returns (success, error_msg)"""
+        if not self.is_logged_in:
+            return False, "Not logged in"
+        try:
+            if not self.client.delete_post(uri):
+                return False, "削除に失敗しました"
+            return True, None
+        except Exception as e:
+            return False, str(e)
 
     def like_post(self, uri, cid):
         """Like a post. Returns (success, error_msg)."""

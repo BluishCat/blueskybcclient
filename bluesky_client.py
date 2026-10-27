@@ -53,10 +53,11 @@ class BlueskyApp:
     def handle_login(self, username, password):
         return self.api.login(username, password)
 
-    def handle_post(self, text, images=None, video=None, on_progress=None):
+    def handle_post(self, text, images=None, video=None, on_progress=None, reply_to_uri=None):
+        """ポストを送信する。reply_to_uri を渡すとそのポストへの返信になる"""
         # Bluesky は画像と動画を同時に添付できないため、動画があれば動画として扱う
         if video:
-            return self._post_video(text, video, on_progress)
+            return self._post_video(text, video, on_progress, reply_to_uri)
         if images:
             images_bytes = []
             image_alts = []
@@ -73,10 +74,10 @@ class BlueskyApp:
                     image_alts.append(alt)
                 except Exception as e:
                     pass; # print(f"Failed to load image: {e}")
-            return self.api.send_post_with_images(text, images_bytes, image_alts=image_alts)
-        return self.api.send_post(text)
+            return self.api.send_post_with_images(text, images_bytes, image_alts=image_alts, reply_to_uri=reply_to_uri)
+        return self.api.send_post(text, reply_to_uri=reply_to_uri)
 
-    def _post_video(self, text, video, on_progress):
+    def _post_video(self, text, video, on_progress, reply_to_uri=None):
         """動画添付ポスト。video は UI が組み立てた {"path", "info", "alt"}"""
         path = video["path"]
         with open(path, "rb") as f:
@@ -93,10 +94,25 @@ class BlueskyApp:
             alt=video["alt"],
             aspect_ratio=aspect_ratio,
             on_progress=on_progress,
+            reply_to_uri=reply_to_uri,
         )
 
     def handle_repost(self, post):
         return self.api.repost_post(post.uri, post.cid)
+
+    def is_own_post(self, post):
+        """ログイン中のアカウントのポストか（ハンドル変更に左右されないよう URI の DID で見る）"""
+        did = self.api.did
+        return bool(did and post.is_post and post.uri.startswith(f"at://{did}/"))
+
+    def handle_delete(self, post):
+        if not self.is_own_post(post):
+            return False, "自分のポストではないため削除できません"
+        success, err = self.api.delete_post(post.uri)
+        if success:
+            self.bookmarked_uris.discard(post.uri)
+            self.read_post_uris.discard(post.uri)
+        return success, err
 
     def handle_like(self, post):
         return self.api.like_post(post.uri, post.cid)

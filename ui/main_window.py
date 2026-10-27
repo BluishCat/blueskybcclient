@@ -82,6 +82,12 @@ def _patched_prepare_create(self, win):
     _orig_prepare_create(self, win)
 eg.Element.prepare_create = _patched_prepare_create
 
+def _snippet(text, limit):
+    """改行・連続空白を詰めて limit 文字に切り詰めた本文の抜粋（確認表示用）"""
+    s = " ".join((text or "").split())
+    return s[:limit] + "…" if len(s) > limit else s
+
+
 def _set_elem_visible(elem, visible: bool):
     """Show or hide a TkEasyGUI element using pack_forget/pack.
     Bypasses TkEasyGUI's broken update(visible=..) which tries to pass
@@ -434,6 +440,8 @@ class MainWindow:
         self.current_image_idx = 0
         self.inline_post_images = [] # List of {"data": data/path, "alt": ""}
         self.inline_post_video = None # {"path", "info", "alt"} 画像とは排他
+        self.reply_target = None # 返信先の Post。None なら通常のポスト
+        self._reply_row_next = None # 返信表示行を再表示するときに直前へ差し込む行フレーム
         self.selected_image_index = 0 # Currently editing image index
         self._app_ref = app_ref
         self._avatar_queue = queue.Queue()
@@ -1106,6 +1114,10 @@ class MainWindow:
                                     layout2=[[
                                         eg.Frame(" 新規ポスト ", [
                                             [
+                                                eg.Text("", key="-INLINE_REPLY_INFO-", font=("sans-serif", 9), text_color="blue", expand_x=True),
+                                                eg.Button("返信をやめる", key="-INLINE_REPLY_CANCEL-", size=(10, 1), font=("sans-serif", 8))
+                                            ],
+                                            [
                                                 eg.Multiline("", size=(60, 2), key="-INLINE_POST_TEXT-", expand_x=True, enable_events=True),
                                                 eg.Column([
                                                     [eg.Button("📁", key="-INLINE_POST_ADD_IMAGE-", size=(4, 1))],
@@ -1121,7 +1133,7 @@ class MainWindow:
                                                 ], text_align="right", expand_x=True),
                                                 eg.Text("0/300", key="-INLINE_POST_CHAR_COUNT-", font=("sans-serif", 9), text_color="gray")
                                             ]
-                                        ], expand_x=True, expand_y=False)
+                                        ], key="-INLINE_POST_FRAME-", expand_x=True, expand_y=False)
                                     ]],
                                     key="-LEFT_COLUMN_PANED-",
                                     orient="vertical",
@@ -1204,6 +1216,7 @@ class MainWindow:
         # Hide initial logic
         window["-DETAIL_PANED-"].set_pane2_visible(False)
         _set_elem_visible(window["-INLINE_POST_CLEAR_IMAGE-"], False)
+        self._show_reply_row(window, False)
         for i in range(4):
             _set_elem_visible(window[f"-INLINE_POST_SLOT_{i}-"], False)
         
@@ -1332,6 +1345,13 @@ class MainWindow:
         try:
             widget = window["-INLINE_POST_TEXT-"].widget
             bind_accel(widget, "Return", submit_inline)
+
+            # 返信モード中の Esc で通常のポストに戻す
+            def cancel_reply(e):
+                if self.reply_target:
+                    window.events.put(("-INLINE_REPLY_CANCEL-", {}))
+                    return "break"
+            widget.bind("<Escape>", cancel_reply)
             
             # クリップボードからの貼り付け (Ctrl+V)
             def handle_paste(e):
@@ -1473,6 +1493,13 @@ class MainWindow:
         window.window.bind("<KeyPress>", _on_space_key_press, add="+")
         window.window.bind("<KeyRelease>", _on_space_key_release, add="+")
 
+        # Ctrl+R: 選択中のポストに返信
+        def _on_reply_key(e):
+            if self.current_selected_post:
+                window.events.put(("-ACTION_REPLY-", {"post": self.current_selected_post}))
+            return "break"
+        bind_accel(window.window, "r", _on_reply_key)
+
         # Bind double-click, right-click and column-reorder events
         self._column_reorderers = {}  # tab_key -> ColumnReorderer
         for tab in tabs:
@@ -1508,6 +1535,26 @@ class MainWindow:
                     return on_right_click
                 
                 bind_right_click(table_elem.widget, make_rc_handler(tab))
+
+                # Delete: 選択中の自分のポストを削除（確認ダイアログ付き）
+                def make_delete_handler(t):
+                    def on_delete(e, _tab=t):
+                        tree = window[f"-TIMELINE_{_tab.tab_key}-"].widget
+                        sel = tree.selection()
+                        if not sel:
+                            return "break"
+                        try:
+                            post = _tab.posts[list(tree.get_children()).index(sel[0])]
+                        except (ValueError, IndexError):
+                            return "break"
+                        if self._app_ref and hasattr(self._app_ref, "is_own_post") and self._app_ref.is_own_post(post):
+                            window.events.put(("-ACTION_DELETE-", {"post": post}))
+                        else:
+                            window["-STATUS_BAR-"].update(" 削除できるのは自分のポストだけです")
+                        return "break"
+                    return on_delete
+
+                table_elem.widget.bind("<Delete>", make_delete_handler(tab))
 
                 def make_select_handler(tab_key=tab.tab_key):
                     def handler(e):
@@ -2062,6 +2109,26 @@ class MainWindow:
 
                 self.apply_unread_tags(window, updated_tabs)
                 self._start_avatar_downloads(window, tabs_to_update)
+            elif event == "-ACTION_REPLY-":
+                post = values.get("post")
+                if post and post.is_post:
+                    self._set_reply_target(window, post)
+                elif post:
+                    window["-STATUS_BAR-"].update(" このポストには返信できません（いいね・リポスト等の通知）")
+            elif event == "-INLINE_REPLY_CANCEL-":
+                self._set_reply_target(window, None)
+            elif event == "-ACTION_DELETE-":
+                post = values.get("post")
+                if post and hasattr(self, "_app_ref") and self._app_ref:
+                    import tkinter.messagebox as _mb
+                    if _mb.askyesno(
+                        "ポストを削除",
+                        f"このポストを削除しますか？\n\n{_snippet(post.text, 80)}\n\n削除したポストは元に戻せません。",
+                        icon="warning", default="no", parent=window.window,
+                    ):
+                        threading.Thread(target=self._do_delete_async, args=(window, post), daemon=True).start()
+            elif event == "-POST_DELETED-":
+                self._remove_post_from_tabs(window, values.get("post"), tabs, all_tabs_in_session)
             elif event == "-ACTION_REPOST-":
                 post = values.get("post")
                 if post and hasattr(self, "_app_ref") and self._app_ref:
@@ -2098,11 +2165,13 @@ class MainWindow:
                 
                 status_elem = window["-STATUS_BAR-"]
                 if success:
-                    if action == "ポスト":
+                    if action in ("ポスト", "返信"):
                         try:
                             window["-INLINE_POST_TEXT-"].update("")
                             window["-INLINE_POST_CHAR_COUNT-"].update("0/300", text_color="gray")
                         except Exception: pass
+                    if action == "返信":
+                        self._set_reply_target(window, None)
                     if status_elem:
                         status_elem.update(f" 成功: {action}")
                         window.window.after(5000, lambda: status_elem.update(" 準備完了") if status_elem.widget.cget("text") == f" 成功: {action}" else None)
@@ -2167,6 +2236,9 @@ class MainWindow:
                 # Use current state of images which now includes alt text
                 images = self.inline_post_images
                 video = self.inline_post_video
+                # 「新規ポスト」ダイアログからの投稿は返信モードに関係なく通常のポストにする
+                reply = None if data_dict.get("-NO_REPLY-") else self.reply_target
+                action_name = "返信" if reply else "ポスト"
                 if text and text.strip():
                     if len(text.strip()) > 300:
                         import tkinter.messagebox as _mb
@@ -2178,7 +2250,8 @@ class MainWindow:
 
                         threading.Thread(
                             target=self._do_action_async,
-                            args=(window, "ポスト", self.post_callback, text.strip(), images, video, on_video_progress),
+                            args=(window, action_name, self.post_callback, text.strip(), images, video, on_video_progress,
+                                  reply.uri if reply else None),
                             daemon=True
                         ).start()
             elif event == "-VIDEO_PROGRESS-":
@@ -2298,14 +2371,99 @@ class MainWindow:
     def _do_action_async(self, window, action_name, func, *args):
         try:
             success, err = func(*args)
-            if success and action_name == "ポスト":
+            if success and action_name in ("ポスト", "返信"):
                 window.window.after(100, lambda: self._reset_inline_post_images(window))
-            elif action_name == "ポスト":
+            elif action_name in ("ポスト", "返信"):
                 # 失敗時は添付を残し、動画の進捗表示だけ元に戻す
                 window.window.after(100, lambda: self._update_image_status(window, "-INLINE_POST_"))
             window.events.put(("-ACTION_COMPLETE-", {"action": action_name, "success": success, "error": err}))
         except Exception as e:
             window.events.put(("-ACTION_COMPLETE-", {"action": action_name, "success": False, "error": str(e)}))
+
+    def _do_delete_async(self, window, post):
+        try:
+            success, err = self._app_ref.handle_delete(post)
+        except Exception as e:
+            success, err = False, str(e)
+        if success:
+            window.events.put(("-POST_DELETED-", {"post": post}))
+        window.events.put(("-ACTION_COMPLETE-", {"action": "削除", "success": success, "error": err}))
+
+    def _remove_post_from_tabs(self, window, post, tabs, all_tabs):
+        """削除したポストを全タブから取り除いて一覧を描き直す
+
+        すぐ再取得しても AppView への反映待ちで削除前の内容が返ることがあるため、手元で消す。
+        """
+        if not post:
+            return
+        uri = post.uri
+        changed = []
+        for t in all_tabs:
+            remaining = [p for p in t.posts if p.uri != uri]
+            if len(remaining) != len(t.posts):
+                t.posts = remaining
+                changed.append(t)
+
+        for t in changed:
+            list_items = [self.format_post_for_list(p) for p in t.posts]
+            if not list_items:
+                list_items = [["(No posts yet)", "", "Click Refresh", "", 0, 0]]
+            table_elem = window[f"-TIMELINE_{t.tab_key}-"]
+            if table_elem:
+                table_elem.update(values=list_items)
+                self._refresh_tree_items(window, t.tab_key)
+        if changed:
+            self.apply_unread_tags(window, tabs)
+            self._start_avatar_downloads(window, changed)
+
+        if self.reply_target and self.reply_target.uri == uri:
+            self._set_reply_target(window, None)
+        if self.current_selected_post and self.current_selected_post.uri == uri:
+            # 詳細ペインは残すが、削除済みのポストへ返信・削除などができないよう選択を外す
+            self.current_selected_post = None
+            try:
+                window["-DETAIL_DATE-"].update(f"{post.created_at}（削除済み）")
+            except Exception:
+                pass
+
+    def _show_reply_row(self, window, visible):
+        """新規ポスト枠の先頭にある「返信先」行を出し入れする
+
+        中身だけ pack_forget すると空の行フレームが高さを持ったまま残るので、行ごと外す。
+        再表示時は元の位置（本文入力行の前）へ差し込む。
+        """
+        try:
+            row = window["-INLINE_REPLY_INFO-"].widget.master
+            parent = row.master
+            if visible:
+                if not row.winfo_manager():
+                    opts = {"side": "top", "fill": "x"}
+                    if self._reply_row_next is not None:
+                        opts["before"] = self._reply_row_next
+                    row.pack(**opts)
+            elif row.winfo_manager():
+                slaves = parent.pack_slaves()
+                idx = slaves.index(row)
+                self._reply_row_next = slaves[idx + 1] if idx + 1 < len(slaves) else None
+                row.pack_forget()
+        except Exception:
+            pass
+
+    def _set_reply_target(self, window, post):
+        """インライン入力欄を post への返信モードにする。post=None で通常のポストに戻す"""
+        self.reply_target = post
+        try:
+            if post:
+                window["-INLINE_REPLY_INFO-"].update(f"↩ {post.author_display_name} (@{post.author_handle}) に返信: {_snippet(post.text, 40)}")
+            else:
+                window["-INLINE_REPLY_INFO-"].update("")
+            self._show_reply_row(window, bool(post))
+            window["-INLINE_POST_BTN-"].widget.configure(text="返信" if post else "ポスト")
+            window["-INLINE_POST_FRAME-"].widget.configure(text=" 返信 " if post else " 新規ポスト ")
+            if post:
+                window["-INLINE_POST_TEXT-"].widget.focus_set()
+        except Exception:
+            pass
 
     def _reset_inline_post_images(self, window):
         self.inline_post_images = []
@@ -2334,6 +2492,9 @@ class MainWindow:
     def _show_context_menu(self, window, post, x_root, y_root):
         import tkinter as tk
         menu = tk.Menu(window.window, tearoff=0)
+        menu.add_command(label="返信 (Ctrl+R)", command=lambda: window.dispatch_event("-ACTION_REPLY-", {"post": post}),
+                         state="normal" if post.is_post else "disabled")
+        menu.add_separator()
         menu.add_command(label="リポスト", command=lambda: window.dispatch_event("-ACTION_REPOST-", {"post": post}))
         menu.add_command(label="お気に入り", command=lambda: window.dispatch_event("-ACTION_LIKE-", {"post": post}))
         
@@ -2349,6 +2510,10 @@ class MainWindow:
         menu.add_command(label="プロフィールを表示", command=lambda: window.dispatch_event("-ACTION_SHOW_PROFILE-", {"author": post.author_handle}))
         menu.add_command(label=f"@{post.author_handle} をフォロー", command=lambda: window.dispatch_event("-ACTION_FOLLOW-", {"author": post.author_handle}))
         menu.add_command(label=f"@{post.author_handle} のフォロー解除", command=lambda: window.dispatch_event("-ACTION_UNFOLLOW-", {"author": post.author_handle}))
+
+        if self._app_ref and hasattr(self._app_ref, "is_own_post") and self._app_ref.is_own_post(post):
+            menu.add_separator()
+            menu.add_command(label="ポストを削除… (Delete)", command=lambda: window.dispatch_event("-ACTION_DELETE-", {"post": post}))
         menu.tk_popup(x_root, y_root)
 
     def save_current_ui_state(self, window, tabs):
@@ -2800,7 +2965,7 @@ class MainWindow:
                     # 投稿はインライン側のハンドラが処理するため、添付もそちらへ引き渡す
                     self.inline_post_images = self._dialog_images
                     self.inline_post_video = self._dialog_video
-                    parent_window.events.put(("-INLINE_POST_BTN-", {"-INLINE_POST_TEXT-": text.strip()}))
+                    parent_window.events.put(("-INLINE_POST_BTN-", {"-INLINE_POST_TEXT-": text.strip(), "-NO_REPLY-": True}))
                 break
         
         window.close()
