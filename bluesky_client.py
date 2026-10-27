@@ -29,6 +29,7 @@ from utils.ui_config import save_ui_state, load_ui_state
 from utils.encryption import decrypt_password  # legacy config.json migration only
 from utils import credentials
 from utils.paths import get_resource_path, get_app_dir
+from utils import updater
 from ui.main_window import MainWindow
 
 class _PostOnlyFeedView:
@@ -55,6 +56,8 @@ class BlueskyApp:
         self.hashtag_tabs = list(self.ui_state.get("hashtag_tabs", []))
         # 投稿したタグ・クリックして開いたタグの履歴（新しい順）。入力欄の「#」ボタンから選べる
         self.hashtag_history = list(self.ui_state.get("hashtag_history", []))
+        # 自己更新後に新しい exe を起動してから終了するか
+        self.restart_requested = False
         
         self.ui = MainWindow(
             login_callback=self.handle_login,
@@ -368,13 +371,42 @@ class BlueskyApp:
                 for tab in self.tabs:
                     tab.clear()
                 continue # Go back to the top of the loop (login screen)
+            elif action == "Restart":
+                self.restart_requested = True
+                break
             else:
                 break # Exit application
 
+def _cleanup_update_leftovers():
+    """前回の自己更新で残った Poisora.exe.old などを消す。
+    直前まで旧プロセスが掴んでいることがあるので、少し待ちながら数回試す。"""
+    if not updater.can_self_update():
+        return
+
+    def worker():
+        import time
+        for _ in range(10):
+            updater.cleanup_leftovers()
+            exe = os.path.abspath(sys.executable)
+            folder, base = os.path.dirname(exe), os.path.basename(exe)
+            try:
+                if not any(n.startswith(base + ".") for n in os.listdir(folder)):
+                    return
+            except OSError:
+                return
+            time.sleep(2)
+
+    import threading
+    threading.Thread(target=worker, daemon=True).start()
+
+
 if __name__ == "__main__":
+    _cleanup_update_leftovers()
     app = BlueskyApp()
     try:
         app.run()
+        if app.restart_requested:
+            updater.restart_app()
     except Exception as e:
         import TkEasyGUI as eg
         eg.popup(f"Fatal error: {traceback.format_exc()}", title="Error")
