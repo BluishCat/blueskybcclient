@@ -149,6 +149,13 @@ class BlueskyClientWrapper:
             pass; # print(f"Error fetching feed {feed_uri}: {e}")
             return []
 
+    def search_hashtag(self, tag, limit=30):
+        """ハッシュタグ #tag の付いたポストを新しい順に返す（PostView のリスト）"""
+        if not self.is_logged_in:
+            return []
+        response = self.client.app.bsky.feed.search_posts({"q": f"#{tag}", "sort": "latest", "limit": limit})
+        return response.posts
+
     def send_post(self, text, reply_to_uri=None, quote_uri=None):
         """テキストのみのポスト。Returns (success, error_msg)
 

@@ -31,6 +31,15 @@ from utils import credentials
 from utils.paths import get_resource_path, get_app_dir
 from ui.main_window import MainWindow
 
+class _PostOnlyFeedView:
+    """PostView を Post.from_feed_view に渡すための入れ物（検索結果などリポスト情報の無いもの）"""
+    reason = None
+    reply = None
+
+    def __init__(self, post):
+        self.post = post
+
+
 class BlueskyApp:
     def __init__(self):
         self.api = BlueskyClientWrapper()
@@ -42,6 +51,8 @@ class BlueskyApp:
         self.read_post_uris = set(self.ui_state.get("read_post_uris", []))
         self.bookmarked_uris = set(self.ui_state.get("bookmarked_uris", []))
         self.hidden_tabs = set(self.ui_state.get("hidden_tabs", []))
+        # ハッシュタグをクリックして開いたタブ（タグの一覧。再起動後も開いたままにする）
+        self.hashtag_tabs = list(self.ui_state.get("hashtag_tabs", []))
         
         self.ui = MainWindow(
             login_callback=self.handle_login,
@@ -185,6 +196,11 @@ class BlueskyApp:
                         try:
                             posts.append(Post.from_feed_view(item))
                         except Exception: pass
+                elif tab.tab_type == "hashtag":
+                    for p_view in self.api.search_hashtag(tab.hashtag, limit=30):
+                        try:
+                            posts.append(Post.from_feed_view(_PostOnlyFeedView(p_view)))
+                        except Exception: pass
                 elif tab.tab_type == "bookmarks":
                     if self.bookmarked_uris:
                         raw_posts = self.api.get_posts(list(self.bookmarked_uris))
@@ -243,6 +259,10 @@ class BlueskyApp:
         pinned = self.api.get_pinned_feeds()
         for f in pinned:
             unsorted_tabs.append(TimelineTabModel(f["name"], "feed", f["uri"]))
+
+        # ハッシュタグのタブ
+        for tag in self.hashtag_tabs:
+            unsorted_tabs.append(TimelineTabModel.for_hashtag(tag))
             
         # Sort based on saved order if available
         saved_order = self.ui_state.get("tab_order", [])

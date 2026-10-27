@@ -16,6 +16,7 @@ from utils.mp4 import read_video_info
 from utils.version import __version__
 from utils.platform_compat import bind_accel, bind_right_click, hook_dropfiles
 from utils import richtext
+from models.tab import TimelineTabModel
 
 # ウィンドウタイトルの共通部分。ログイン後の統計付きタイトルも同じ前半を使う
 APP_TITLE = f"Poisora v{__version__}"
@@ -82,6 +83,9 @@ def _patched_prepare_create(self, win):
     self.props.pop('element_justification', None)
     _orig_prepare_create(self, win)
 eg.Element.prepare_create = _patched_prepare_create
+
+# タイムライン一覧の列見出し
+TIMELINE_HEADINGS = ["名前", "返信先", "本文", "日時", "RT", "いいね"]
 
 # 詳細ペインでリンク・メンション・タグに付ける Text タグ名
 FACET_TAGS = {"link": "url", "mention": "mention", "tag": "hashtag"}
@@ -693,8 +697,60 @@ class MainWindow:
             if isinstance(value, str) and value.startswith("did:"):
                 window.dispatch_event("-ACTION_SHOW_PROFILE-", {"author": value})
         elif kind == "tag":
-            from urllib.parse import quote
-            open_url_safely(f"https://bsky.app/hashtag/{quote(value, safe='')}")
+            window.dispatch_event("-OPEN_HASHTAG_TAB-", {"tag": value})
+
+    def _open_hashtag_tab(self, window, tag, tabs, all_tabs):
+        """#tag の検索結果タブを開いて選択する。既にあればそのタブへ切り替えるだけ"""
+        new_tab = TimelineTabModel.for_hashtag(tag)
+        tab = next((t for t in all_tabs if t.tab_key == new_tab.tab_key), None)
+        notebook = window["-TABGROUP-"].widget
+
+        if tab is None:
+            tab = new_tab
+            # TkEasyGUI は起動後に要素を足す公開 API が無いため、レイアウトからの生成処理を直接使う
+            window._create_widget(notebook, [[self._make_tab_element(tab)]])
+            self._setup_added_tab(tab)
+            # 列の幅・並びは既存のタブに合わせる
+            source = next((t for t in tabs if window.get_element_by_key(f"-TIMELINE_{t.tab_key}-")), None)
+            if source:
+                self.sync_columns(window[f"-TIMELINE_{source.tab_key}-"].widget, [tab], window)
+            tabs.append(tab)
+            all_tabs.append(tab)
+            if self._app_ref is not None:
+                hashtag_tabs = getattr(self._app_ref, "hashtag_tabs", None)
+                if hashtag_tabs is not None and tag not in hashtag_tabs:
+                    hashtag_tabs.append(tag)
+            self.save_current_ui_state(window, tabs)
+            self._refresh_feed_menu_entries(tabs, all_tabs, window)
+        elif tab not in tabs:
+            # フィードメニューで非表示にしていたタブは表示に戻す
+            self._toggle_tab_visibility(window, tab, tabs, all_tabs)
+
+        notebook.select(window[f"-TAB_{tab.tab_key}-"].widget)
+        window.events.put(("-ASYNC_REFRESH_START-", {"tab_key": tab.tab_key}))
+
+    def _close_hashtag_tab(self, window, tab, tabs, all_tabs):
+        """ハッシュタグのタブを閉じる（非表示ではなく削除。再起動後も出てこない）"""
+        try:
+            tab_widget = window[f"-TAB_{tab.tab_key}-"].widget
+            window["-TABGROUP-"].widget.forget(tab_widget)
+            tab_widget.destroy()
+        except Exception:
+            pass
+        for key in (f"-TAB_{tab.tab_key}-", f"-TIMELINE_{tab.tab_key}-"):
+            window.key_elements.pop(key, None)
+        for lst in (tabs, all_tabs):
+            if tab in lst:
+                lst.remove(tab)
+        self._column_reorderers.pop(tab.tab_key, None)
+        self._tree_items.pop(tab.tab_key, None)
+        self._loaded_tabs.discard(tab.tab_key)
+        if self._app_ref is not None:
+            if tab.hashtag in getattr(self._app_ref, "hashtag_tabs", []):
+                self._app_ref.hashtag_tabs.remove(tab.hashtag)
+            getattr(self._app_ref, "hidden_tabs", set()).discard(tab.tab_key)
+        self.save_current_ui_state(window, tabs)
+        self._refresh_feed_menu_entries(tabs, all_tabs, window)
 
 
     def _embed_post_box(self, text_widget, body, meta, border_color, header=False):
@@ -1081,34 +1137,37 @@ class MainWindow:
         # Note: In-place modification of the shared 'tabs' list works here
         # since BlueskyApp holds a reference to the same list.
 
+    def _make_tab_element(self, tab):
+        """タイムライン 1 タブぶんの eg.Tab（中に一覧の CustomTable）を作る"""
+        tab_name = tab.name
+        if any(not p.is_read for p in tab.posts):
+            tab_name = "● " + tab_name
+
+        list_items = [self.format_post_for_list(p) for p in tab.posts]
+        if not list_items:
+            list_items = [["（投稿なし）", "", "更新してください", "", 0, 0]]
+
+        # Use default character-based widths for constructor
+        current_col_widths = [13, 12, 40, 19, 6, 6]
+
+        tab_layout = [
+            [CustomTable(
+                values=list_items,
+                headings=TIMELINE_HEADINGS,
+                col_widths=current_col_widths,
+                key=f"-TIMELINE_{tab.tab_key}-",
+                expand_x=True,
+                expand_y=True,
+                pad=(0, 0)
+            )]
+        ]
+        return eg.Tab(tab_name, tab_layout, key=f"-TAB_{tab.tab_key}-", pad=(0, 0))
+
     def show_main(self, tabs: list):
         tab_layouts = []
-        headings = ["名前", "返信先", "本文", "日時", "RT", "いいね"]
-        
+
         for i, tab in enumerate(tabs):
-            tab_name = tab.name
-            if any(not p.is_read for p in tab.posts):
-                tab_name = "● " + tab_name
-            
-            list_items = [self.format_post_for_list(p) for p in tab.posts]
-            if not list_items:
-                list_items = [["（投稿なし）", "", "更新してください", "", 0, 0]]
-
-            # Use default character-based widths for constructor
-            current_col_widths = [13, 12, 40, 19, 6, 6]
-
-            tab_layout = [
-                [CustomTable(
-                    values=list_items, 
-                    headings=headings, 
-                    col_widths=current_col_widths,
-                    key=f"-TIMELINE_{tab.tab_key}-", 
-                    expand_x=True, 
-                    expand_y=True,
-                    pad=(0, 0)
-                )]
-            ]
-            tab_layouts.append(eg.Tab(tab_name, tab_layout, key=f"-TAB_{tab.tab_key}-", pad=(0, 0)))
+            tab_layouts.append(self._make_tab_element(tab))
         # Keep a record of all tabs that have widgets in this session (includes later-hidden ones)
         all_tabs_in_session = list(tabs)
 
@@ -1515,7 +1574,7 @@ class MainWindow:
         self._update_ui_fonts(window)
         
         # FINAL HARD FIX for Treeview (Ensure icons visible, no tree-padding)
-        for tab in tabs:
+        def _fix_tree_layout(tab):
             elem = window[f"-TIMELINE_{tab.tab_key}-"]
             if elem and hasattr(elem, "_tree"):
                 tree = elem._tree
@@ -1531,6 +1590,9 @@ class MainWindow:
                     if tab_frame:
                         tab_frame.pack_configure(padx=0, pady=0)
                 except Exception: pass
+
+        for tab in tabs:
+            _fix_tree_layout(tab)
         
         # Bind image configure for auto-resize
         def _on_image_configure(e):
@@ -1563,7 +1625,8 @@ class MainWindow:
 
         # Bind double-click, right-click and column-reorder events
         self._column_reorderers = {}  # tab_key -> ColumnReorderer
-        for tab in tabs:
+
+        def _setup_timeline_table(tab):
             table_elem = window[f"-TIMELINE_{tab.tab_key}-"]
             if table_elem:
                 table_elem.widget.bind("<Double-Button-1>", lambda e: window.dispatch_event("-TABLE_DOUBLE_CLICK-"))
@@ -1627,6 +1690,15 @@ class MainWindow:
                         window.dispatch_event(f"-TIMELINE_{tab_key}-")
                     return handler
                 table_elem.widget.bind("<<TreeviewSelect>>", make_select_handler())
+
+        for tab in tabs:
+            _setup_timeline_table(tab)
+
+        # 後からタブを足したときに、起動時と同じ見た目調整とバインドをする
+        def _setup_added_tab(tab):
+            _fix_tree_layout(tab)
+            _setup_timeline_table(tab)
+        self._setup_added_tab = _setup_added_tab
         
         image_elem = window["-IMAGE-"]
         if image_elem:
@@ -1674,7 +1746,7 @@ class MainWindow:
                 target = _facet_at(event)
                 if target:
                     kind, value = target
-                    label = {"link": "🔗 ", "mention": "👤 プロフィールを開く: ", "tag": "# bsky.app でタグを検索: "}[kind]
+                    label = {"link": "🔗 ", "mention": "👤 プロフィールを開く: ", "tag": "# タグのタブを開く: #"}[kind]
                     status = window["-STATUS_BAR-"]
                     if hover["saved"] is None:
                         hover["saved"] = status.widget.cget("text")
@@ -1983,6 +2055,10 @@ class MainWindow:
                                 if target_tab.tab_type == "feed":
                                     menu.add_command(label="フィードを削除", command=lambda t=target_tab: hide_tab(t))
                                     menu.add_separator()
+                                elif target_tab.tab_type == "hashtag":
+                                    menu.add_command(label="タブを閉じる",
+                                                     command=lambda t=target_tab: self._close_hashtag_tab(window, t, tabs, all_tabs_in_session))
+                                    menu.add_separator()
                                 
                                 menu.add_command(label="（サウンドなし）", command=lambda t=target_tab: set_sound(t, None))
                                 menu.add_separator()
@@ -2227,6 +2303,10 @@ class MainWindow:
                         icon="warning", default="no", parent=window.window,
                     ):
                         threading.Thread(target=self._do_delete_async, args=(window, post), daemon=True).start()
+            elif event == "-OPEN_HASHTAG_TAB-":
+                tag = (values or {}).get("tag")
+                if tag:
+                    self._open_hashtag_tab(window, tag, tabs, all_tabs_in_session)
             elif event == "-POST_DELETED-":
                 self._remove_post_from_tabs(window, values.get("post"), tabs, all_tabs_in_session)
             elif event in ("-ACTION_REPOST-", "-ACTION_LIKE-"):
@@ -2794,6 +2874,7 @@ class MainWindow:
                 state["read_post_uris"] = list(self._app_ref.read_post_uris)
                 state["bookmarked_uris"] = list(getattr(self._app_ref, "bookmarked_uris", []))
                 state["hidden_tabs"] = list(getattr(self._app_ref, "hidden_tabs", []))
+                state["hashtag_tabs"] = list(getattr(self._app_ref, "hashtag_tabs", []))
             elif hasattr(self, "app_ref") and self.app_ref:
                 state["read_post_uris"] = list(self.app_ref.read_post_uris)
                 state["bookmarked_uris"] = list(getattr(self.app_ref, "bookmarked_uris", []))
