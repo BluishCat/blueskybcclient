@@ -15,6 +15,7 @@ from utils.paths import get_resource_path
 from utils.mp4 import read_video_info
 from utils.version import __version__
 from utils.platform_compat import bind_accel, bind_right_click, hook_dropfiles
+from utils import richtext
 
 # ウィンドウタイトルの共通部分。ログイン後の統計付きタイトルも同じ前半を使う
 APP_TITLE = f"Poisora v{__version__}"
@@ -81,6 +82,9 @@ def _patched_prepare_create(self, win):
     self.props.pop('element_justification', None)
     _orig_prepare_create(self, win)
 eg.Element.prepare_create = _patched_prepare_create
+
+# 詳細ペインでリンク・メンション・タグに付ける Text タグ名
+FACET_TAGS = {"link": "url", "mention": "mention", "tag": "hashtag"}
 
 # 入力欄からの投稿として扱うアクション名（成功したら入力欄と添付を空にする）
 COMPOSER_ACTIONS = ("ポスト", "返信", "引用")
@@ -635,7 +639,7 @@ class MainWindow:
         text_widget.config(state="normal")
         text_widget.delete("1.0", "end")
         
-        text_widget.insert(tk.END, post.text + "\n")
+        self._insert_rich_text(text_widget, post)
 
         # 引用元（本文のすぐ下）→ 返信元 の順に枠付きで埋め込む
         if getattr(post, 'quote_author', None):
@@ -656,15 +660,41 @@ class MainWindow:
                 meta += f" {date_text}"
             self._embed_post_box(text_widget, post.reply_parent_text, meta, "pink")
 
-        import re
-        url_pattern = re.compile(r'https?://[^\s]+')
-        content = text_widget.get("1.0", "end-1c")
-        for match in url_pattern.finditer(content):
-            start_idx = f"1.0 + {match.start()} chars"
-            end_idx = f"1.0 + {match.end()} chars"
-            text_widget.tag_add("url", start_idx, end_idx)
-            
         text_widget.config(state="disabled")
+
+    def _insert_rich_text(self, text_widget, post):
+        """本文を挿入し、リンク・メンション・タグの部分に押せるタグを付ける
+
+        ポストの facets があればそれを使う（公式アプリは長い URL を本文では省略表示し、
+        正しい URL は facets にだけ入れるため）。facets が無いポストは本文から URL を探す。
+        Tk の文字位置は絵文字などで Python とずれることがあるので、位置計算はせず区切って挿入する。
+        """
+        text = post.text or ""
+        spans = getattr(post, "facet_spans", None) or [
+            (s, e, "link", url) for s, e, url in richtext.find_links(text)
+        ]
+        self._detail_facets = {}
+        pos = 0
+        for i, (start, end, kind, value) in enumerate(spans):
+            if start < pos:
+                continue
+            text_widget.insert(tk.END, text[pos:start])
+            name = f"facet-{i}"
+            self._detail_facets[name] = (kind, value)
+            text_widget.insert(tk.END, text[start:end], (FACET_TAGS[kind], name))
+            pos = end
+        text_widget.insert(tk.END, text[pos:] + "\n")
+
+    def _open_facet(self, window, kind, value):
+        """詳細ペインのリンク・メンション・タグが押されたとき"""
+        if kind == "link":
+            open_url_safely(value)
+        elif kind == "mention":
+            if isinstance(value, str) and value.startswith("did:"):
+                window.dispatch_event("-ACTION_SHOW_PROFILE-", {"author": value})
+        elif kind == "tag":
+            from urllib.parse import quote
+            open_url_safely(f"https://bsky.app/hashtag/{quote(value, safe='')}")
 
 
     def _embed_post_box(self, text_widget, body, meta, border_color, header=False):
@@ -1615,24 +1645,56 @@ class MainWindow:
 
         text_widget = window["-DETAIL_TEXT-"].widget
         text_widget.tag_configure("url", foreground="blue", underline=True)
-        
-        def on_url_click(event):
-            try:
-                index = text_widget.index(f"@{event.x},{event.y}")
-                tags = text_widget.tag_names(index)
-                if "url" in tags:
-                    ranges = text_widget.tag_ranges("url")
-                    for i in range(0, len(ranges), 2):
-                        if text_widget.compare(ranges[i], "<=", index) and text_widget.compare(index, "<=", ranges[i+1]):
-                            url = text_widget.get(ranges[i], ranges[i+1])
-                            open_url_safely(url)
-                            break
-            except Exception as e:
-                pass; # print(f"URL click error: {e}")
+        text_widget.tag_configure("mention", foreground="#7b3fbf")
+        text_widget.tag_configure("hashtag", foreground="#c25a00")
 
-        text_widget.tag_bind("url", "<Button-1>", on_url_click)
-        text_widget.tag_bind("url", "<Enter>", lambda e: text_widget.config(cursor="hand2"))
-        text_widget.tag_bind("url", "<Leave>", lambda e: text_widget.config(cursor=""))
+        def _facet_at(event):
+            """マウス位置のリンク・メンション・タグ (種類, 値)。無ければ None"""
+            index = text_widget.index(f"@{event.x},{event.y}")
+            for name in text_widget.tag_names(index):
+                target = getattr(self, "_detail_facets", {}).get(name)
+                if target:
+                    return target
+            return None
+
+        def on_facet_click(event):
+            try:
+                target = _facet_at(event)
+                if target:
+                    self._open_facet(window, *target)
+            except Exception:
+                pass
+
+        # 省略表示のリンクでも行き先が分かるよう、ポイント中はステータスバーに出す
+        hover = {"saved": None}
+
+        def on_facet_enter(event):
+            text_widget.config(cursor="hand2")
+            try:
+                target = _facet_at(event)
+                if target:
+                    kind, value = target
+                    label = {"link": "🔗 ", "mention": "👤 プロフィールを開く: ", "tag": "# bsky.app でタグを検索: "}[kind]
+                    status = window["-STATUS_BAR-"]
+                    if hover["saved"] is None:
+                        hover["saved"] = status.widget.cget("text")
+                    status.update(f" {label}{value}")
+            except Exception:
+                pass
+
+        def on_facet_leave(event):
+            text_widget.config(cursor="")
+            if hover["saved"] is not None:
+                try:
+                    window["-STATUS_BAR-"].update(hover["saved"])
+                except Exception:
+                    pass
+                hover["saved"] = None
+
+        for tag in FACET_TAGS.values():
+            text_widget.tag_bind(tag, "<Button-1>", on_facet_click)
+            text_widget.tag_bind(tag, "<Enter>", on_facet_enter)
+            text_widget.tag_bind(tag, "<Leave>", on_facet_leave)
 
         # Bind right-click on tabs
         tab_group = window["-TABGROUP-"]

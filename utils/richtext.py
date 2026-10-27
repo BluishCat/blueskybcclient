@@ -98,6 +98,11 @@ def detect(text):
     return [Span(kind, _byte_pos(text, s), _byte_pos(text, e), v) for s, e, kind, v in found]
 
 
+def find_links(text):
+    """本文中の URL を (開始文字位置, 終了文字位置, URL) で返す（facets が無いポストの表示用）"""
+    return list(_find_links(text or ""))
+
+
 def first_link(text):
     """本文中で最初に出てくる URL（リンクカード用）。無ければ None"""
     for span in detect(text):

@@ -28,6 +28,50 @@ def format_bluesky_date(date_str):
         # パース不能な日時はそのまま返す
         return date_str
 
+def _facet_spans(text, facets):
+    """record.facets（UTF-8 のバイト位置）を本文の文字位置の範囲にする
+
+    Returns [(開始文字位置, 終了文字位置, 種類, 値)]。種類は link / mention / tag、
+    値はそれぞれ URL / DID / タグ（# なし）。位置が文字の途中を指すものや重なるものは捨てる。
+    """
+    if not text or not facets:
+        return []
+    byte_to_char = {}
+    pos = 0
+    for i, ch in enumerate(text):
+        byte_to_char[pos] = i
+        pos += len(ch.encode("utf-8"))
+    byte_to_char[pos] = len(text)
+
+    spans = []
+    for facet in facets:
+        try:
+            index = facet.index
+            start = byte_to_char.get(index.byte_start)
+            end = byte_to_char.get(index.byte_end)
+            if start is None or end is None or start >= end:
+                continue
+            for feature in facet.features:
+                if getattr(feature, 'uri', None):
+                    spans.append((start, end, 'link', feature.uri))
+                elif getattr(feature, 'did', None):
+                    spans.append((start, end, 'mention', feature.did))
+                elif getattr(feature, 'tag', None):
+                    spans.append((start, end, 'tag', feature.tag))
+                else:
+                    continue
+                break
+        except Exception:
+            continue
+    spans.sort()
+    result = []
+    for span in spans:
+        if result and span[0] < result[-1][1]:
+            continue
+        result.append(span)
+    return result
+
+
 def _quoted_view(embed):
     """埋め込みから引用元ポストのビュー (app.bsky.embed.record#viewRecord) を取り出す。無ければ None
 
@@ -73,7 +117,7 @@ def _media_urls(media):
 
 
 class Post:
-    def __init__(self, author_handle, author_display_name, text, created_at, uri=None, cid=None, reply_to=None, thumbnail_urls=None, full_image_urls=None, repost_count=0, like_count=0, avatar_url=None, reply_parent_author=None, reply_parent_handle=None, reply_parent_text=None, quote_author=None, quote_handle=None, quote_text=None, is_repost=False, reposted_by_author=None, reposted_by_handle=None, is_follower=False, is_video=False, media_from_quote=False, quote_created_at=None, viewer_like_uri=None, viewer_repost_uri=None, reply_disabled=False, embedding_disabled=False):
+    def __init__(self, author_handle, author_display_name, text, created_at, uri=None, cid=None, reply_to=None, thumbnail_urls=None, full_image_urls=None, repost_count=0, like_count=0, avatar_url=None, reply_parent_author=None, reply_parent_handle=None, reply_parent_text=None, quote_author=None, quote_handle=None, quote_text=None, is_repost=False, reposted_by_author=None, reposted_by_handle=None, is_follower=False, is_video=False, facet_spans=None, media_from_quote=False, quote_created_at=None, viewer_like_uri=None, viewer_repost_uri=None, reply_disabled=False, embedding_disabled=False):
         self.author_handle = author_handle
         self.author_display_name = author_display_name or author_handle
         self.text = text
@@ -88,6 +132,8 @@ class Post:
         self.thumbnail_urls = thumbnail_urls or []
         self.full_image_urls = full_image_urls or []
         self.is_video = is_video
+        # 本文中のリンク・メンション・タグ（_facet_spans の戻り値）。詳細ペインで押せるようにする
+        self.facet_spans = facet_spans or []
         self.repost_count = repost_count or 0
         self.like_count = like_count or 0
         self.avatar_url = avatar_url
@@ -214,6 +260,7 @@ class Post:
             media_from_quote=media_from_quote,
             is_follower=is_follower,
             is_video=is_video,
+            facet_spans=_facet_spans(text, getattr(record, 'facets', None)),
             viewer_like_uri=getattr(viewer, 'like', None),
             viewer_repost_uri=getattr(viewer, 'repost', None),
             reply_disabled=bool(getattr(viewer, 'reply_disabled', False)),
@@ -243,7 +290,8 @@ class Post:
             thumbnail_urls=[],
             full_image_urls=[],
             avatar_url=getattr(author, 'avatar', None),
-            is_follower=is_follower
+            is_follower=is_follower,
+            facet_spans=_facet_spans(text, getattr(record, 'facets', None)),
         )
 
     @property
