@@ -53,11 +53,11 @@ class BlueskyApp:
     def handle_login(self, username, password):
         return self.api.login(username, password)
 
-    def handle_post(self, text, images=None, video=None, on_progress=None, reply_to_uri=None):
-        """ポストを送信する。reply_to_uri を渡すとそのポストへの返信になる"""
+    def handle_post(self, text, images=None, video=None, on_progress=None, reply_to_uri=None, quote_uri=None):
+        """ポストを送信する。reply_to_uri で返信、quote_uri で引用になる（併用可）"""
         # Bluesky は画像と動画を同時に添付できないため、動画があれば動画として扱う
         if video:
-            return self._post_video(text, video, on_progress, reply_to_uri)
+            return self._post_video(text, video, on_progress, reply_to_uri, quote_uri)
         if images:
             images_bytes = []
             image_alts = []
@@ -74,10 +74,11 @@ class BlueskyApp:
                     image_alts.append(alt)
                 except Exception as e:
                     pass; # print(f"Failed to load image: {e}")
-            return self.api.send_post_with_images(text, images_bytes, image_alts=image_alts, reply_to_uri=reply_to_uri)
-        return self.api.send_post(text, reply_to_uri=reply_to_uri)
+            return self.api.send_post_with_images(text, images_bytes, image_alts=image_alts,
+                                                  reply_to_uri=reply_to_uri, quote_uri=quote_uri)
+        return self.api.send_post(text, reply_to_uri=reply_to_uri, quote_uri=quote_uri)
 
-    def _post_video(self, text, video, on_progress, reply_to_uri=None):
+    def _post_video(self, text, video, on_progress, reply_to_uri=None, quote_uri=None):
         """動画添付ポスト。video は UI が組み立てた {"path", "info", "alt"}"""
         path = video["path"]
         with open(path, "rb") as f:
@@ -95,10 +96,22 @@ class BlueskyApp:
             aspect_ratio=aspect_ratio,
             on_progress=on_progress,
             reply_to_uri=reply_to_uri,
+            quote_uri=quote_uri,
         )
 
     def handle_repost(self, post):
-        return self.api.repost_post(post.uri, post.cid)
+        """リポストしていなければリポスト、していれば取り消す。成功したら post の状態も更新する"""
+        if post.viewer_repost_uri:
+            success, err = self.api.unrepost_post(post.viewer_repost_uri)
+            if success:
+                post.viewer_repost_uri = None
+                post.repost_count = max(0, post.repost_count - 1)
+        else:
+            success, err, repost_uri = self.api.repost_post(post.uri, post.cid)
+            if success:
+                post.viewer_repost_uri = repost_uri
+                post.repost_count += 1
+        return success, err
 
     def is_own_post(self, post):
         """ログイン中のアカウントのポストか（ハンドル変更に左右されないよう URI の DID で見る）"""
@@ -115,7 +128,18 @@ class BlueskyApp:
         return success, err
 
     def handle_like(self, post):
-        return self.api.like_post(post.uri, post.cid)
+        """お気に入りしていなければお気に入り、していれば取り消す。成功したら post の状態も更新する"""
+        if post.viewer_like_uri:
+            success, err = self.api.unlike_post(post.viewer_like_uri)
+            if success:
+                post.viewer_like_uri = None
+                post.like_count = max(0, post.like_count - 1)
+        else:
+            success, err, like_uri = self.api.like_post(post.uri, post.cid)
+            if success:
+                post.viewer_like_uri = like_uri
+                post.like_count += 1
+        return success, err
 
     def handle_follow(self, author_handle):
         return self.api.follow_user(author_handle)

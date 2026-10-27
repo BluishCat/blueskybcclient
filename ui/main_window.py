@@ -82,6 +82,10 @@ def _patched_prepare_create(self, win):
     _orig_prepare_create(self, win)
 eg.Element.prepare_create = _patched_prepare_create
 
+# 入力欄からの投稿として扱うアクション名（成功したら入力欄と添付を空にする）
+COMPOSER_ACTIONS = ("ポスト", "返信", "引用")
+
+
 def _snippet(text, limit):
     """改行・連続空白を詰めて limit 文字に切り詰めた本文の抜粋（確認表示用）"""
     s = " ".join((text or "").split())
@@ -441,6 +445,8 @@ class MainWindow:
         self.inline_post_images = [] # List of {"data": data/path, "alt": ""}
         self.inline_post_video = None # {"path", "info", "alt"} 画像とは排他
         self.reply_target = None # 返信先の Post。None なら通常のポスト
+        self.quote_target = None # 引用する Post。返信と併用できる
+        self._toggles_in_flight = set() # 送信中の (種類, uri)。連打で二重にいいね等しないため
         self._reply_row_next = None # 返信表示行を再表示するときに直前へ差し込む行フレーム
         self.selected_image_index = 0 # Currently editing image index
         self._app_ref = app_ref
@@ -1115,7 +1121,7 @@ class MainWindow:
                                         eg.Frame(" 新規ポスト ", [
                                             [
                                                 eg.Text("", key="-INLINE_REPLY_INFO-", font=("sans-serif", 9), text_color="blue", expand_x=True),
-                                                eg.Button("返信をやめる", key="-INLINE_REPLY_CANCEL-", size=(10, 1), font=("sans-serif", 8))
+                                                eg.Button("返信をやめる", key="-INLINE_REPLY_CANCEL-", font=("sans-serif", 8))
                                             ],
                                             [
                                                 eg.Multiline("", size=(60, 2), key="-INLINE_POST_TEXT-", expand_x=True, enable_events=True),
@@ -1346,9 +1352,9 @@ class MainWindow:
             widget = window["-INLINE_POST_TEXT-"].widget
             bind_accel(widget, "Return", submit_inline)
 
-            # 返信モード中の Esc で通常のポストに戻す
+            # 返信・引用モード中の Esc で通常のポストに戻す
             def cancel_reply(e):
-                if self.reply_target:
+                if self.reply_target or self.quote_target:
                     window.events.put(("-INLINE_REPLY_CANCEL-", {}))
                     return "break"
             widget.bind("<Escape>", cancel_reply)
@@ -2111,12 +2117,20 @@ class MainWindow:
                 self._start_avatar_downloads(window, tabs_to_update)
             elif event == "-ACTION_REPLY-":
                 post = values.get("post")
-                if post and post.is_post:
+                if post and post.can_reply:
                     self._set_reply_target(window, post)
                 elif post:
-                    window["-STATUS_BAR-"].update(" このポストには返信できません（いいね・リポスト等の通知）")
+                    reason = "返信できない設定のポストです" if post.is_post else "いいね・リポスト等の通知です"
+                    window["-STATUS_BAR-"].update(f" このポストには返信できません（{reason}）")
+            elif event == "-ACTION_QUOTE-":
+                post = values.get("post")
+                if post and post.can_quote:
+                    self._set_quote_target(window, post)
+                elif post:
+                    reason = "引用できない設定のポストです" if post.is_post else "いいね・リポスト等の通知です"
+                    window["-STATUS_BAR-"].update(f" このポストは引用できません（{reason}）")
             elif event == "-INLINE_REPLY_CANCEL-":
-                self._set_reply_target(window, None)
+                self._clear_composer_mode(window)
             elif event == "-ACTION_DELETE-":
                 post = values.get("post")
                 if post and hasattr(self, "_app_ref") and self._app_ref:
@@ -2129,14 +2143,14 @@ class MainWindow:
                         threading.Thread(target=self._do_delete_async, args=(window, post), daemon=True).start()
             elif event == "-POST_DELETED-":
                 self._remove_post_from_tabs(window, values.get("post"), tabs, all_tabs_in_session)
-            elif event == "-ACTION_REPOST-":
+            elif event in ("-ACTION_REPOST-", "-ACTION_LIKE-"):
                 post = values.get("post")
-                if post and hasattr(self, "_app_ref") and self._app_ref:
-                    threading.Thread(target=self._do_action_async, args=(window, "リポスト", self._app_ref.handle_repost, post), daemon=True).start()
-            elif event == "-ACTION_LIKE-":
-                post = values.get("post")
-                if post and hasattr(self, "_app_ref") and self._app_ref:
-                    threading.Thread(target=self._do_action_async, args=(window, "お気に入り", self._app_ref.handle_like, post), daemon=True).start()
+                kind = "repost" if event == "-ACTION_REPOST-" else "like"
+                if post and hasattr(self, "_app_ref") and self._app_ref and (kind, post.uri) not in self._toggles_in_flight:
+                    self._toggles_in_flight.add((kind, post.uri))
+                    threading.Thread(target=self._do_toggle_async, args=(window, kind, post), daemon=True).start()
+            elif event == "-POST_STATE_CHANGED-":
+                self._sync_post_state(window, values.get("post"), all_tabs_in_session)
             elif event == "-ACTION_FOLLOW-":
                 author = values.get("author")
                 if author and hasattr(self, "_app_ref") and self._app_ref:
@@ -2165,16 +2179,18 @@ class MainWindow:
                 
                 status_elem = window["-STATUS_BAR-"]
                 if success:
-                    if action in ("ポスト", "返信"):
+                    if action in COMPOSER_ACTIONS:
                         try:
                             window["-INLINE_POST_TEXT-"].update("")
                             window["-INLINE_POST_CHAR_COUNT-"].update("0/300", text_color="gray")
                         except Exception: pass
-                    if action == "返信":
-                        self._set_reply_target(window, None)
+                    if action in ("返信", "引用"):
+                        self._clear_composer_mode(window)
                     if status_elem:
                         status_elem.update(f" 成功: {action}")
-                        window.window.after(5000, lambda: status_elem.update(" 準備完了") if status_elem.widget.cget("text") == f" 成功: {action}" else None)
+                        # action は既定引数で固定する（ループ変数のままだと、5秒の間に別の操作をすると
+                        # その操作の「成功」表示を消してしまう）
+                        window.window.after(5000, lambda a=action: status_elem.update(" 準備完了") if status_elem.widget.cget("text") == f" 成功: {a}" else None)
                 else:
                     if status_elem:
                         status_elem.update(f" エラー ({action}): {error}")
@@ -2236,9 +2252,11 @@ class MainWindow:
                 # Use current state of images which now includes alt text
                 images = self.inline_post_images
                 video = self.inline_post_video
-                # 「新規ポスト」ダイアログからの投稿は返信モードに関係なく通常のポストにする
-                reply = None if data_dict.get("-NO_REPLY-") else self.reply_target
-                action_name = "返信" if reply else "ポスト"
+                # 「新規ポスト」ダイアログからの投稿は返信・引用モードに関係なく通常のポストにする
+                plain = data_dict.get("-PLAIN_POST-")
+                reply = None if plain else self.reply_target
+                quote = None if plain else self.quote_target
+                action_name = "返信" if reply else "引用" if quote else "ポスト"
                 if text and text.strip():
                     if len(text.strip()) > 300:
                         import tkinter.messagebox as _mb
@@ -2251,7 +2269,7 @@ class MainWindow:
                         threading.Thread(
                             target=self._do_action_async,
                             args=(window, action_name, self.post_callback, text.strip(), images, video, on_video_progress,
-                                  reply.uri if reply else None),
+                                  reply.uri if reply else None, quote.uri if quote else None),
                             daemon=True
                         ).start()
             elif event == "-VIDEO_PROGRESS-":
@@ -2371,9 +2389,9 @@ class MainWindow:
     def _do_action_async(self, window, action_name, func, *args):
         try:
             success, err = func(*args)
-            if success and action_name in ("ポスト", "返信"):
+            if success and action_name in COMPOSER_ACTIONS:
                 window.window.after(100, lambda: self._reset_inline_post_images(window))
-            elif action_name in ("ポスト", "返信"):
+            elif action_name in COMPOSER_ACTIONS:
                 # 失敗時は添付を残し、動画の進捗表示だけ元に戻す
                 window.window.after(100, lambda: self._update_image_status(window, "-INLINE_POST_"))
             window.events.put(("-ACTION_COMPLETE-", {"action": action_name, "success": success, "error": err}))
@@ -2418,6 +2436,8 @@ class MainWindow:
 
         if self.reply_target and self.reply_target.uri == uri:
             self._set_reply_target(window, None)
+        if self.quote_target and self.quote_target.uri == uri:
+            self._set_quote_target(window, None)
         if self.current_selected_post and self.current_selected_post.uri == uri:
             # 詳細ペインは残すが、削除済みのポストへ返信・削除などができないよう選択を外す
             self.current_selected_post = None
@@ -2450,20 +2470,95 @@ class MainWindow:
             pass
 
     def _set_reply_target(self, window, post):
-        """インライン入力欄を post への返信モードにする。post=None で通常のポストに戻す"""
+        """インライン入力欄を post への返信モードにする。post=None で返信をやめる"""
         self.reply_target = post
+        self._refresh_composer_mode(window, focus=bool(post))
+
+    def _set_quote_target(self, window, post):
+        """インライン入力欄を post の引用モードにする。post=None で引用をやめる"""
+        self.quote_target = post
+        self._refresh_composer_mode(window, focus=bool(post))
+
+    def _clear_composer_mode(self, window):
+        self.reply_target = None
+        self.quote_target = None
+        self._refresh_composer_mode(window)
+
+    def _refresh_composer_mode(self, window, focus=False):
+        """返信先・引用元の表示行、枠の見出し、ボタンの文言を今のモードに合わせる"""
+        reply, quote = self.reply_target, self.quote_target
+        lines = []
+        if reply:
+            lines.append(f"↩ {reply.author_display_name} (@{reply.author_handle}) に返信: {_snippet(reply.text, 40)}")
+        if quote:
+            lines.append(f"❝ {quote.author_display_name} (@{quote.author_handle}) を引用: {_snippet(quote.text, 40)}")
+        if reply and quote:
+            title, cancel = " 返信（引用付き） ", "返信・引用をやめる"
+        elif reply:
+            title, cancel = " 返信 ", "返信をやめる"
+        elif quote:
+            title, cancel = " 引用ポスト ", "引用をやめる"
+        else:
+            title, cancel = " 新規ポスト ", "返信をやめる"
         try:
-            if post:
-                window["-INLINE_REPLY_INFO-"].update(f"↩ {post.author_display_name} (@{post.author_handle}) に返信: {_snippet(post.text, 40)}")
-            else:
-                window["-INLINE_REPLY_INFO-"].update("")
-            self._show_reply_row(window, bool(post))
-            window["-INLINE_POST_BTN-"].widget.configure(text="返信" if post else "ポスト")
-            window["-INLINE_POST_FRAME-"].widget.configure(text=" 返信 " if post else " 新規ポスト ")
-            if post:
+            window["-INLINE_REPLY_INFO-"].update("\n".join(lines))
+            self._show_reply_row(window, bool(lines))
+            window["-INLINE_REPLY_CANCEL-"].widget.configure(text=cancel)
+            window["-INLINE_POST_BTN-"].widget.configure(text="返信" if reply else "ポスト")
+            window["-INLINE_POST_FRAME-"].widget.configure(text=title)
+            if focus:
                 window["-INLINE_POST_TEXT-"].widget.focus_set()
         except Exception:
             pass
+
+    def _do_toggle_async(self, window, kind, post):
+        """お気に入り / リポストの付け外し（今の状態の逆にする）"""
+        if kind == "like":
+            action = "お気に入り解除" if post.viewer_like_uri else "お気に入り"
+            func = self._app_ref.handle_like
+        else:
+            action = "リポスト取り消し" if post.viewer_repost_uri else "リポスト"
+            func = self._app_ref.handle_repost
+        try:
+            success, err = func(post)
+        except Exception as e:
+            success, err = False, str(e)
+        finally:
+            self._toggles_in_flight.discard((kind, post.uri))
+        if success:
+            window.events.put(("-POST_STATE_CHANGED-", {"post": post}))
+        window.events.put(("-ACTION_COMPLETE-", {"action": action, "success": success, "error": err}))
+
+    def _sync_post_state(self, window, post, all_tabs):
+        """お気に入り・リポストの状態と件数を、同じポストを表示している全タブの行と詳細ペインに反映する"""
+        if not post:
+            return
+        for t in all_tabs:
+            table_elem = window[f"-TIMELINE_{t.tab_key}-"]
+            items = None
+            for idx, p in enumerate(t.posts):
+                if p.uri != post.uri:
+                    continue
+                if p is not post:
+                    p.viewer_like_uri = post.viewer_like_uri
+                    p.viewer_repost_uri = post.viewer_repost_uri
+                    p.like_count = post.like_count
+                    p.repost_count = post.repost_count
+                if table_elem and table_elem.widget:
+                    if items is None:
+                        items = self._get_tree_items(table_elem.widget, t.tab_key)
+                    if idx < len(items):
+                        try:
+                            table_elem.widget.item(items[idx], values=self.format_post_for_list(p))
+                        except Exception:
+                            pass
+        cur = self.current_selected_post
+        if cur and cur.uri == post.uri:
+            try:
+                window["-DETAIL_REPOST-"].update(f"🔁 {cur.repost_count}")
+                window["-DETAIL_LIKE-"].update(f"❤ {cur.like_count}")
+            except Exception:
+                pass
 
     def _reset_inline_post_images(self, window):
         self.inline_post_images = []
@@ -2493,10 +2588,14 @@ class MainWindow:
         import tkinter as tk
         menu = tk.Menu(window.window, tearoff=0)
         menu.add_command(label="返信 (Ctrl+R)", command=lambda: window.dispatch_event("-ACTION_REPLY-", {"post": post}),
-                         state="normal" if post.is_post else "disabled")
+                         state="normal" if post.can_reply else "disabled")
+        menu.add_command(label="引用", command=lambda: window.dispatch_event("-ACTION_QUOTE-", {"post": post}),
+                         state="normal" if post.can_quote else "disabled")
         menu.add_separator()
-        menu.add_command(label="リポスト", command=lambda: window.dispatch_event("-ACTION_REPOST-", {"post": post}))
-        menu.add_command(label="お気に入り", command=lambda: window.dispatch_event("-ACTION_LIKE-", {"post": post}))
+        menu.add_command(label="リポスト取り消し" if post.viewer_repost_uri else "リポスト",
+                         command=lambda: window.dispatch_event("-ACTION_REPOST-", {"post": post}))
+        menu.add_command(label="お気に入り解除" if post.viewer_like_uri else "お気に入り",
+                         command=lambda: window.dispatch_event("-ACTION_LIKE-", {"post": post}))
         
         # Check if already bookmarked
         is_bookmarked = False
@@ -2965,7 +3064,7 @@ class MainWindow:
                     # 投稿はインライン側のハンドラが処理するため、添付もそちらへ引き渡す
                     self.inline_post_images = self._dialog_images
                     self.inline_post_video = self._dialog_video
-                    parent_window.events.put(("-INLINE_POST_BTN-", {"-INLINE_POST_TEXT-": text.strip(), "-NO_REPLY-": True}))
+                    parent_window.events.put(("-INLINE_POST_BTN-", {"-INLINE_POST_TEXT-": text.strip(), "-PLAIN_POST-": True}))
                 break
         
         window.close()

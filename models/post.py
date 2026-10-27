@@ -29,7 +29,7 @@ def format_bluesky_date(date_str):
         return date_str
 
 class Post:
-    def __init__(self, author_handle, author_display_name, text, created_at, uri=None, cid=None, reply_to=None, thumbnail_urls=None, full_image_urls=None, repost_count=0, like_count=0, avatar_url=None, reply_parent_author=None, reply_parent_handle=None, reply_parent_text=None, quote_author=None, quote_handle=None, quote_text=None, is_repost=False, reposted_by_author=None, reposted_by_handle=None, is_follower=False, is_video=False):
+    def __init__(self, author_handle, author_display_name, text, created_at, uri=None, cid=None, reply_to=None, thumbnail_urls=None, full_image_urls=None, repost_count=0, like_count=0, avatar_url=None, reply_parent_author=None, reply_parent_handle=None, reply_parent_text=None, quote_author=None, quote_handle=None, quote_text=None, is_repost=False, reposted_by_author=None, reposted_by_handle=None, is_follower=False, is_video=False, viewer_like_uri=None, viewer_repost_uri=None, reply_disabled=False, embedding_disabled=False):
         self.author_handle = author_handle
         self.author_display_name = author_display_name or author_handle
         self.text = text
@@ -54,6 +54,11 @@ class Post:
         self.quote_handle = quote_handle
         self.quote_text = quote_text
         self.is_follower = is_follower
+        # 自分との関係（ログイン中アカウントのいいね・リポストのレコード URI、返信・引用の可否）
+        self.viewer_like_uri = viewer_like_uri
+        self.viewer_repost_uri = viewer_repost_uri
+        self.reply_disabled = reply_disabled
+        self.embedding_disabled = embedding_disabled
 
     @classmethod
     def from_feed_view(cls, feed_view_post):
@@ -166,6 +171,7 @@ class Post:
                         full_image_urls.append(media.external.uri)
                 
         avatar_url = getattr(author, 'avatar', None)
+        viewer = getattr(post, 'viewer', None)
         return cls(
             author_handle=author.handle,
             author_display_name=author.display_name,
@@ -189,7 +195,11 @@ class Post:
             quote_handle=quote_handle,
             quote_text=quote_text,
             is_follower=is_follower,
-            is_video=is_video
+            is_video=is_video,
+            viewer_like_uri=getattr(viewer, 'like', None),
+            viewer_repost_uri=getattr(viewer, 'repost', None),
+            reply_disabled=bool(getattr(viewer, 'reply_disabled', False)),
+            embedding_disabled=bool(getattr(viewer, 'embedding_disabled', False)),
         )
 
     @classmethod
@@ -222,6 +232,14 @@ class Post:
     def is_post(self):
         """返信できる実体のポストか。いいね・リポスト・フォロー通知の URI はポストではない"""
         return bool(self.uri) and "/app.bsky.feed.post/" in self.uri
+
+    @property
+    def can_reply(self):
+        return self.is_post and not self.reply_disabled
+
+    @property
+    def can_quote(self):
+        return self.is_post and not self.embedding_disabled
 
     def __str__(self):
         return f"{self.author_display_name} (@{self.author_handle})\n{self.text}\n{self.created_at}"
