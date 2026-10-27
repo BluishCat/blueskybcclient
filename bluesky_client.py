@@ -53,6 +53,8 @@ class BlueskyApp:
         self.hidden_tabs = set(self.ui_state.get("hidden_tabs", []))
         # ハッシュタグをクリックして開いたタブ（タグの一覧。再起動後も開いたままにする）
         self.hashtag_tabs = list(self.ui_state.get("hashtag_tabs", []))
+        # 投稿したタグ・クリックして開いたタグの履歴（新しい順）。入力欄の「#」ボタンから選べる
+        self.hashtag_history = list(self.ui_state.get("hashtag_history", []))
         
         self.ui = MainWindow(
             login_callback=self.handle_login,

@@ -84,6 +84,9 @@ def _patched_prepare_create(self, win):
     _orig_prepare_create(self, win)
 eg.Element.prepare_create = _patched_prepare_create
 
+# ハッシュタグ履歴の上限件数
+HASHTAG_HISTORY_MAX = 50
+
 # タイムライン一覧の列見出し
 TIMELINE_HEADINGS = ["名前", "返信先", "本文", "日時", "RT", "いいね"]
 
@@ -729,6 +732,68 @@ class MainWindow:
         notebook.select(window[f"-TAB_{tab.tab_key}-"].widget)
         window.events.put(("-ASYNC_REFRESH_START-", {"tab_key": tab.tab_key}))
 
+    def _hashtag_history(self):
+        """ハッシュタグの履歴（新しい順のリスト）。アプリ側に無ければ空リスト"""
+        history = getattr(self._app_ref, "hashtag_history", None)
+        return history if history is not None else []
+
+    def _remember_hashtags(self, window, tags, tabs):
+        """タグを履歴の先頭へ入れる（大文字小文字違いは同じタグとして、最後に使った表記で残す）"""
+        history = self._hashtag_history()
+        if self._app_ref is None or not tags:
+            return
+        # 1つのポストに複数あるときは本文の順で並ぶよう、後ろから先頭へ入れる
+        for tag in reversed(tags):
+            history[:] = [t for t in history if t.lower() != tag.lower()]
+            history.insert(0, tag)
+        del history[HASHTAG_HISTORY_MAX:]
+        self.save_current_ui_state(window, tabs)
+
+    def _show_hashtag_menu(self, window, tabs):
+        """入力欄の「#」ボタン: 履歴から選んでカーソル位置に入れるメニュー"""
+        history = self._hashtag_history()
+        button = window["-INLINE_POST_HASHTAG-"].widget
+        menu = tk.Menu(window.window, tearoff=0)
+        if not history:
+            menu.add_command(label="（履歴はまだありません）", state="disabled")
+            menu.add_command(label="ハッシュタグを付けて投稿するか、詳細ペインのタグを開くと増えます", state="disabled")
+        else:
+            for tag in history:
+                menu.add_command(label=f"#{tag}", command=lambda t=tag: self._insert_hashtag(window, t))
+            menu.add_separator()
+            remove_menu = tk.Menu(menu, tearoff=0)
+            for tag in history:
+                remove_menu.add_command(label=f"#{tag}", command=lambda t=tag: self._forget_hashtag(window, t, tabs))
+            remove_menu.add_separator()
+            remove_menu.add_command(label="すべて消去…", command=lambda: self._forget_hashtag(window, None, tabs))
+            menu.add_cascade(label="履歴から削除", menu=remove_menu)
+        menu.tk_popup(button.winfo_rootx(), button.winfo_rooty() + button.winfo_height())
+
+    def _forget_hashtag(self, window, tag, tabs):
+        """履歴からタグを消す。tag=None なら確認のうえ全部消す"""
+        history = self._hashtag_history()
+        if tag is None:
+            if not messagebox.askyesno("ハッシュタグの履歴", "履歴をすべて消去しますか？", default="no", parent=window.window):
+                return
+            history.clear()
+        else:
+            history[:] = [t for t in history if t != tag]
+        self.save_current_ui_state(window, tabs)
+
+    def _insert_hashtag(self, window, tag):
+        """入力欄のカーソル位置に #tag を入れる。前後が文字ならタグとして認識されるよう空白を補う"""
+        widget = window["-INLINE_POST_TEXT-"].widget
+        before = widget.get("insert -1 chars", "insert") if widget.compare("insert", ">", "1.0") else ""
+        after = widget.get("insert", "insert +1 chars")
+        text = f"#{tag}"
+        if before and not before.isspace():
+            text = " " + text
+        if not after or after == "\n" or not after.isspace():
+            text += " "
+        widget.insert("insert", text)
+        widget.focus_set()
+        widget.event_generate("<KeyRelease>")  # 文字数カウンターを更新
+
     def _close_hashtag_tab(self, window, tab, tabs, all_tabs):
         """ハッシュタグのタブを閉じる（非表示ではなく削除。再起動後も出てこない）"""
         try:
@@ -1240,7 +1305,8 @@ class MainWindow:
                                             [
                                                 eg.Multiline("", size=(60, 2), key="-INLINE_POST_TEXT-", expand_x=True, enable_events=True),
                                                 eg.Column([
-                                                    [eg.Button("📁", key="-INLINE_POST_ADD_IMAGE-", size=(4, 1))],
+                                                    [eg.Button("📁", key="-INLINE_POST_ADD_IMAGE-", size=(4, 1)),
+                                                     eg.Button("#", key="-INLINE_POST_HASHTAG-", size=(3, 1))],
                                                     [eg.Button("ポスト", key="-INLINE_POST_BTN-", size=(8, 1))]
                                                 ], vertical_alignment="top")
                                             ],
@@ -2307,6 +2373,11 @@ class MainWindow:
                 tag = (values or {}).get("tag")
                 if tag:
                     self._open_hashtag_tab(window, tag, tabs, all_tabs_in_session)
+                    self._remember_hashtags(window, [tag], tabs)
+            elif event == "-HASHTAGS_USED-":
+                self._remember_hashtags(window, (values or {}).get("tags", []), tabs)
+            elif event == "-INLINE_POST_HASHTAG-":
+                self._show_hashtag_menu(window, tabs)
             elif event == "-POST_DELETED-":
                 self._remove_post_from_tabs(window, values.get("post"), tabs, all_tabs_in_session)
             elif event in ("-ACTION_REPOST-", "-ACTION_LIKE-"):
@@ -2557,6 +2628,10 @@ class MainWindow:
             success, err = func(*args)
             if success and action_name in COMPOSER_ACTIONS:
                 window.window.after(100, lambda: self._reset_inline_post_images(window))
+                # 投稿した本文のハッシュタグを履歴へ（保存は Tk を触るのでメインスレッドで）
+                tags = [s.value for s in richtext.detect(args[0]) if s.kind == "tag"] if args else []
+                if tags:
+                    window.events.put(("-HASHTAGS_USED-", {"tags": tags}))
             elif action_name in COMPOSER_ACTIONS:
                 # 失敗時は添付を残し、動画の進捗表示だけ元に戻す
                 window.window.after(100, lambda: self._update_image_status(window, "-INLINE_POST_"))
@@ -2875,6 +2950,7 @@ class MainWindow:
                 state["bookmarked_uris"] = list(getattr(self._app_ref, "bookmarked_uris", []))
                 state["hidden_tabs"] = list(getattr(self._app_ref, "hidden_tabs", []))
                 state["hashtag_tabs"] = list(getattr(self._app_ref, "hashtag_tabs", []))
+                state["hashtag_history"] = list(getattr(self._app_ref, "hashtag_history", []))
             elif hasattr(self, "app_ref") and self.app_ref:
                 state["read_post_uris"] = list(self.app_ref.read_post_uris)
                 state["bookmarked_uris"] = list(getattr(self.app_ref, "bookmarked_uris", []))
