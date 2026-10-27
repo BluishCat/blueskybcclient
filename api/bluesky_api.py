@@ -1,8 +1,12 @@
 import time
 from urllib.parse import urlparse
 
+import io
+
 import requests
 from atproto import Client, models
+
+from utils import linkcard, richtext
 
 # 動画は PDS へ直接 uploadBlob するのではなく、公式の動画サービスに先に渡してエンコードさせる。
 # 直接 uploadBlob すると投稿が firehose に流れるまでエンコードが始まらず、
@@ -13,11 +17,28 @@ VIDEO_JOB_TIMEOUT_SEC = 15 * 60      # 10分の動画のエンコード完了を
 VIDEO_JOB_POLL_INTERVAL_SEC = 1.0
 
 
+def _image_aspect_ratio(data):
+    """画像の縦横比。読めなければ None（その場合 Bluesky 側では正方形扱いで表示される）"""
+    try:
+        from PIL import Image
+        with Image.open(io.BytesIO(data)) as img:
+            width, height = img.size
+        return models.AppBskyEmbedDefs.AspectRatio(width=width, height=height)
+    except Exception:
+        return None
+
+
 class BlueskyClientWrapper:
     def __init__(self):
         self.client = Client()
         self.is_logged_in = False
         self.username = None
+
+    @property
+    def did(self):
+        """ログイン中アカウントの DID。ポストの URI は at://<DID>/... なので持ち主の判定に使う"""
+        me = getattr(self.client, "me", None)
+        return me.did if self.is_logged_in and me else None
 
     def login(self, handle, password):
         try:
@@ -128,56 +149,164 @@ class BlueskyClientWrapper:
             pass; # print(f"Error fetching feed {feed_uri}: {e}")
             return []
 
-    def send_post(self, text):
+    def search_hashtag(self, tag, limit=30):
+        """ハッシュタグ #tag の付いたポストを新しい順に返す（PostView のリスト）"""
         if not self.is_logged_in:
-            return False, "Not logged in"
-        
-        try:
-            self.client.send_post(text)
-            return True, None
-        except Exception as e:
-            return False, str(e)
+            return []
+        response = self.client.app.bsky.feed.search_posts({"q": f"#{tag}", "sort": "latest", "limit": limit})
+        return response.posts
 
-    def send_post_with_images(self, text, images_bytes, image_alts=None):
-        if not self.is_logged_in:
-            return False, "Not logged in"
-            
+    def send_post(self, text, reply_to_uri=None, quote_uri=None):
+        """テキストのみのポスト。Returns (success, error_msg)
+
+        reply_to_uri を渡すとそのポストへの返信、quote_uri を渡すとそのポストの引用になる。
+        添付も引用も無く本文に URL があれば、そのページのリンクカードを付ける。
+        """
+        return self._send(text, None, reply_to_uri, quote_uri)
+
+    def send_post_with_images(self, text, images_bytes, image_alts=None, reply_to_uri=None, quote_uri=None):
         if not images_bytes:
-            return self.send_post(text)
-            
-        if not image_alts:
-            image_alts = [""] * len(images_bytes)
-            
-        try:
-            self.client.send_images(text=text, images=images_bytes, image_alts=image_alts)
-            return True, None
-        except Exception as e:
-            return False, str(e)
+            return self.send_post(text, reply_to_uri=reply_to_uri, quote_uri=quote_uri)
 
-    def send_post_with_video(self, text, video_bytes, filename, alt="", aspect_ratio=None, on_progress=None):
+        image_alts = list(image_alts or [])
+        image_alts += [""] * (len(images_bytes) - len(image_alts))
+
+        def make_media():
+            images = [
+                models.AppBskyEmbedImages.Image(
+                    alt=alt or "",
+                    image=self.client.upload_blob(data).blob,
+                    aspect_ratio=_image_aspect_ratio(data),
+                )
+                for data, alt in zip(images_bytes, image_alts)
+            ]
+            return models.AppBskyEmbedImages.Main(images=images)
+
+        return self._send(text, make_media, reply_to_uri, quote_uri)
+
+    def send_post_with_video(self, text, video_bytes, filename, alt="", aspect_ratio=None, on_progress=None,
+                             reply_to_uri=None, quote_uri=None):
         """動画を添付して投稿する。Returns (success, error_msg)
 
         aspect_ratio は (width, height)。取得できなかった場合は None を渡せば embed から省かれる。
         on_progress(state, progress) はエンコードの状態が更新されるたびに呼ばれる。
         """
-        if not self.is_logged_in:
-            return False, "Not logged in"
-
         on_progress = on_progress or (lambda state, progress: None)
 
-        try:
+        def make_media():
             blob = self._upload_video(video_bytes, filename, on_progress)
-
             embed = models.AppBskyEmbedVideo.Main(video=blob, alt=alt)
             if aspect_ratio:
                 embed.aspect_ratio = models.AppBskyEmbedDefs.AspectRatio(
                     width=aspect_ratio[0], height=aspect_ratio[1]
                 )
+            return embed
 
-            self.client.send_post(text, embed=embed)
+        return self._send(text, make_media, reply_to_uri, quote_uri)
+
+    def _send(self, text, make_media, reply_to_uri, quote_uri):
+        """返信先・引用元の確認 → 添付のアップロード → 送信、の順に行う
+
+        返信先や引用元が消えていたら、時間のかかるアップロード（特に動画）の前に失敗させる。
+        """
+        if not self.is_logged_in:
+            return False, "Not logged in"
+        try:
+            reply_to = self._build_reply_ref(reply_to_uri) if reply_to_uri else None
+            quote = self._build_quote_embed(quote_uri) if quote_uri else None
+            media = make_media() if make_media else None
+
+            if media and quote:
+                embed = models.AppBskyEmbedRecordWithMedia.Main(record=quote, media=media)
+            else:
+                embed = media or quote or self._build_link_card(text)
+
+            self.client.send_post(text, reply_to=reply_to, embed=embed, facets=self._build_facets(text))
             return True, None
         except Exception as e:
             return False, str(e)
+
+    def _fetch_post_view(self, uri, missing_message):
+        response = self.client.app.bsky.feed.get_posts({"uris": [uri]})
+        if not response.posts:
+            raise RuntimeError(missing_message)
+        return response.posts[0]
+
+    def _build_reply_ref(self, parent_uri):
+        """返信先ポストの URI から ReplyRef（parent と root の組）を組み立てる
+
+        root にはスレッド先頭のポストを指定する必要がある。親自体が返信なら親のレコードに
+        記録されている root を引き継ぎ、そうでなければ親がそのまま root になる。
+        cid はタイムライン取得時の値を使わず送信直前に取り直す（編集・削除に追従するため）。
+        """
+        parent_view = self._fetch_post_view(parent_uri, "返信先のポストが見つかりません（削除された可能性があります）")
+        if getattr(getattr(parent_view, "viewer", None), "reply_disabled", False):
+            raise RuntimeError("このポストは返信できない設定になっています")
+        parent_ref = models.create_strong_ref(parent_view)
+
+        record = parent_view.record
+        parent_reply = record.get("reply") if isinstance(record, dict) else getattr(record, "reply", None)
+        if parent_reply:
+            root = parent_reply["root"] if isinstance(parent_reply, dict) else parent_reply.root
+            root_ref = models.ComAtprotoRepoStrongRef.Main.model_validate(root)
+        else:
+            root_ref = parent_ref
+
+        return models.AppBskyFeedPost.ReplyRef(parent=parent_ref, root=root_ref)
+
+    def _build_quote_embed(self, quote_uri):
+        """引用元ポストの URI から引用の embed を組み立てる（cid は送信直前に取り直す）"""
+        view = self._fetch_post_view(quote_uri, "引用元のポストが見つかりません（削除された可能性があります）")
+        if getattr(getattr(view, "viewer", None), "embedding_disabled", False):
+            raise RuntimeError("このポストは引用できない設定になっています")
+        return models.AppBskyEmbedRecord.Main(record=models.create_strong_ref(view))
+
+    def _build_facets(self, text):
+        """本文のリンク・メンション・ハッシュタグを facets にする。無ければ None
+
+        メンションはハンドルを DID に引けたものだけ。引けないハンドル（打ち間違いなど）は
+        公式と同じくただの文字列のまま送る。
+        """
+        facets = []
+        for span in richtext.detect(text):
+            if span.kind == "link":
+                feature = models.AppBskyRichtextFacet.Link(uri=span.value)
+            elif span.kind == "tag":
+                feature = models.AppBskyRichtextFacet.Tag(tag=span.value)
+            else:
+                did = self._resolve_handle(span.value)
+                if not did:
+                    continue
+                feature = models.AppBskyRichtextFacet.Mention(did=did)
+            facets.append(models.AppBskyRichtextFacet.Main(
+                index=models.AppBskyRichtextFacet.ByteSlice(byte_start=span.start, byte_end=span.end),
+                features=[feature],
+            ))
+        return facets or None
+
+    def _resolve_handle(self, handle):
+        try:
+            return self.client.resolve_handle(handle).did
+        except Exception:
+            return None
+
+    def _build_link_card(self, text):
+        """本文の最初の URL からリンクカードの embed を作る。作れなければ None（投稿は続ける）"""
+        url = richtext.first_link(text)
+        if not url:
+            return None
+        card = linkcard.fetch_link_card(url)
+        if not card:
+            return None
+        thumb = None
+        if card["image"]:
+            try:
+                thumb = self.client.upload_blob(card["image"]).blob
+            except Exception:
+                thumb = None
+        return models.AppBskyEmbedExternal.Main(external=models.AppBskyEmbedExternal.External(
+            uri=url, title=card["title"], description=card["description"], thumb=thumb,
+        ))
 
     def _upload_video(self, video_bytes, filename, on_progress):
         """動画サービスに動画を渡し、エンコード完了後の BlobRef を返す"""
@@ -238,26 +367,55 @@ class BlueskyClientWrapper:
 
         raise RuntimeError(body.get("message") or body.get("error") or f"HTTP {response.status_code}")
 
-    def like_post(self, uri, cid):
-        """Like a post. Returns (success, error_msg)."""
+    def delete_post(self, uri):
+        """自分のポストを削除する。Returns (success, error_msg)"""
         if not self.is_logged_in:
             return False, "Not logged in"
         try:
-            self.client.like(uri=uri, cid=cid)
+            if not self.client.delete_post(uri):
+                return False, "削除に失敗しました"
             return True, None
         except Exception as e:
-            pass; # print(f"Error liking post: {e}")
+            return False, str(e)
+
+    def like_post(self, uri, cid):
+        """Like a post. Returns (success, error_msg, like_record_uri)."""
+        if not self.is_logged_in:
+            return False, "Not logged in", None
+        try:
+            resp = self.client.like(uri=uri, cid=cid)
+            return True, None, resp.uri
+        except Exception as e:
+            return False, str(e), None
+
+    def unlike_post(self, like_uri):
+        """いいね（お気に入り）を取り消す。like_uri はいいねレコードの URI。Returns (success, error_msg)"""
+        if not self.is_logged_in:
+            return False, "Not logged in"
+        try:
+            self.client.unlike(like_uri)
+            return True, None
+        except Exception as e:
             return False, str(e)
 
     def repost_post(self, uri, cid):
-        """Repost a post. Returns (success, error_msg)."""
+        """Repost a post. Returns (success, error_msg, repost_record_uri)."""
+        if not self.is_logged_in:
+            return False, "Not logged in", None
+        try:
+            resp = self.client.repost(uri=uri, cid=cid)
+            return True, None, resp.uri
+        except Exception as e:
+            return False, str(e), None
+
+    def unrepost_post(self, repost_uri):
+        """リポストを取り消す。repost_uri はリポストレコードの URI。Returns (success, error_msg)"""
         if not self.is_logged_in:
             return False, "Not logged in"
         try:
-            self.client.repost(uri=uri, cid=cid)
+            self.client.unrepost(repost_uri)
             return True, None
         except Exception as e:
-            pass; # print(f"Error reposting post: {e}")
             return False, str(e)
 
     def follow_user(self, handle_or_did):

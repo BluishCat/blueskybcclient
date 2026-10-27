@@ -15,6 +15,8 @@ from utils.paths import get_resource_path
 from utils.mp4 import read_video_info
 from utils.version import __version__
 from utils.platform_compat import bind_accel, bind_right_click, hook_dropfiles
+from utils import richtext
+from models.tab import TimelineTabModel
 
 # ウィンドウタイトルの共通部分。ログイン後の統計付きタイトルも同じ前半を使う
 APP_TITLE = f"Poisora v{__version__}"
@@ -81,6 +83,25 @@ def _patched_prepare_create(self, win):
     self.props.pop('element_justification', None)
     _orig_prepare_create(self, win)
 eg.Element.prepare_create = _patched_prepare_create
+
+# ハッシュタグ履歴の上限件数
+HASHTAG_HISTORY_MAX = 50
+
+# タイムライン一覧の列見出し
+TIMELINE_HEADINGS = ["名前", "返信先", "本文", "日時", "RT", "いいね"]
+
+# 詳細ペインでリンク・メンション・タグに付ける Text タグ名
+FACET_TAGS = {"link": "url", "mention": "mention", "tag": "hashtag"}
+
+# 入力欄からの投稿として扱うアクション名（成功したら入力欄と添付を空にする）
+COMPOSER_ACTIONS = ("ポスト", "返信", "引用")
+
+
+def _snippet(text, limit):
+    """改行・連続空白を詰めて limit 文字に切り詰めた本文の抜粋（確認表示用）"""
+    s = " ".join((text or "").split())
+    return s[:limit] + "…" if len(s) > limit else s
+
 
 def _set_elem_visible(elem, visible: bool):
     """Show or hide a TkEasyGUI element using pack_forget/pack.
@@ -434,6 +455,10 @@ class MainWindow:
         self.current_image_idx = 0
         self.inline_post_images = [] # List of {"data": data/path, "alt": ""}
         self.inline_post_video = None # {"path", "info", "alt"} 画像とは排他
+        self.reply_target = None # 返信先の Post。None なら通常のポスト
+        self.quote_target = None # 引用する Post。返信と併用できる
+        self._toggles_in_flight = set() # 送信中の (種類, uri)。連打で二重にいいね等しないため
+        self._reply_row_next = None # 返信表示行を再表示するときに直前へ差し込む行フレーム
         self.selected_image_index = 0 # Currently editing image index
         self._app_ref = app_ref
         self._avatar_queue = queue.Queue()
@@ -621,55 +646,225 @@ class MainWindow:
         text_widget.config(state="normal")
         text_widget.delete("1.0", "end")
         
-        text_widget.insert(tk.END, post.text + "\n")
-        
+        self._insert_rich_text(text_widget, post)
+
+        # 引用元（本文のすぐ下）→ 返信元 の順に枠付きで埋め込む
+        if getattr(post, 'quote_author', None):
+            body = post.quote_text or ""
+            if post.media_from_quote:
+                body += ("\n" if body else "") + ("🎬 動画あり" if post.is_video else "🖼 画像・リンクカードは右の画像欄に表示")
+            meta = f"❝ {post.quote_author} (@{post.quote_handle})"
+            if post.quote_created_at:
+                meta += f" {post.quote_created_at}"
+            text_widget.insert(tk.END, "\n")
+            self._embed_post_box(text_widget, body, meta, "steelblue", header=True)
+
         if hasattr(post, 'reply_parent_text') and post.reply_parent_text:
             text_widget.insert(tk.END, "\n\n")
-            
-            bg_color = text_widget.cget("bg")
-            fg_color = text_widget.cget("fg")
-            reply_frame = tk.Frame(text_widget, highlightbackground="pink", highlightthickness=1, bg=bg_color)
-            
-            content = post.reply_parent_text or ""
-            reply_txt = tk.Label(reply_frame, text=content, justify="left", anchor="nw", bg=bg_color, fg=fg_color, font=(self.font_family, self.font_size))
-            reply_txt.pack(fill="x", expand=True, padx=5, pady=(5, 0))
-            
-            meta_text = f"- {post.reply_parent_author} (@{post.reply_parent_handle})"
+            meta = f"- {post.reply_parent_author} (@{post.reply_parent_handle})"
             date_text = getattr(post, 'reply_parent_created_at', '')
-            if date_text: meta_text += f" {date_text}"
-            meta_label = tk.Label(reply_frame, text=meta_text, justify="left", bg=bg_color, fg="gray", font=(self.font_family, self.font_size - 1))
-            meta_label.pack(anchor="w", padx=5, pady=(0, 5))
-            
-            text_widget.window_create(tk.END, window=reply_frame, padx=10, pady=5)
-            
-            if not hasattr(text_widget, "_embedded_frames"):
-                text_widget._embedded_frames = []
-                def _on_resize(e):
-                    for f, lbl in text_widget._embedded_frames:
-                        try:
-                            if f.winfo_exists():
-                                fw = e.width - 35
-                                if fw > 0:
-                                    lbl.config(wraplength=fw - 15)
-                        except Exception:
-                            pass
-                text_widget.bind("<Configure>", _on_resize, add="+")
-            
-            text_widget._embedded_frames = [(f, l) for f, l in text_widget._embedded_frames if f.winfo_exists()]
-            text_widget._embedded_frames.append((reply_frame, reply_txt))
-            
-            text_widget.after(10, lambda rt=reply_txt, tw=text_widget: rt.config(wraplength=max(100, tw.winfo_width() - 50)))
-        
-        import re
-        url_pattern = re.compile(r'https?://[^\s]+')
-        content = text_widget.get("1.0", "end-1c")
-        for match in url_pattern.finditer(content):
-            start_idx = f"1.0 + {match.start()} chars"
-            end_idx = f"1.0 + {match.end()} chars"
-            text_widget.tag_add("url", start_idx, end_idx)
-            
+            if date_text:
+                meta += f" {date_text}"
+            self._embed_post_box(text_widget, post.reply_parent_text, meta, "pink")
+
         text_widget.config(state="disabled")
 
+    def _insert_rich_text(self, text_widget, post):
+        """本文を挿入し、リンク・メンション・タグの部分に押せるタグを付ける
+
+        ポストの facets があればそれを使う（公式アプリは長い URL を本文では省略表示し、
+        正しい URL は facets にだけ入れるため）。facets が無いポストは本文から URL を探す。
+        Tk の文字位置は絵文字などで Python とずれることがあるので、位置計算はせず区切って挿入する。
+        """
+        text = post.text or ""
+        spans = getattr(post, "facet_spans", None) or [
+            (s, e, "link", url) for s, e, url in richtext.find_links(text)
+        ]
+        self._detail_facets = {}
+        pos = 0
+        for i, (start, end, kind, value) in enumerate(spans):
+            if start < pos:
+                continue
+            text_widget.insert(tk.END, text[pos:start])
+            name = f"facet-{i}"
+            self._detail_facets[name] = (kind, value)
+            text_widget.insert(tk.END, text[start:end], (FACET_TAGS[kind], name))
+            pos = end
+        text_widget.insert(tk.END, text[pos:] + "\n")
+
+    def _open_facet(self, window, kind, value):
+        """詳細ペインのリンク・メンション・タグが押されたとき"""
+        if kind == "link":
+            open_url_safely(value)
+        elif kind == "mention":
+            if isinstance(value, str) and value.startswith("did:"):
+                window.dispatch_event("-ACTION_SHOW_PROFILE-", {"author": value})
+        elif kind == "tag":
+            window.dispatch_event("-OPEN_HASHTAG_TAB-", {"tag": value})
+
+    def _open_hashtag_tab(self, window, tag, tabs, all_tabs):
+        """#tag の検索結果タブを開いて選択する。既にあればそのタブへ切り替えるだけ"""
+        new_tab = TimelineTabModel.for_hashtag(tag)
+        tab = next((t for t in all_tabs if t.tab_key == new_tab.tab_key), None)
+        notebook = window["-TABGROUP-"].widget
+
+        if tab is None:
+            tab = new_tab
+            # TkEasyGUI は起動後に要素を足す公開 API が無いため、レイアウトからの生成処理を直接使う
+            window._create_widget(notebook, [[self._make_tab_element(tab)]])
+            self._setup_added_tab(tab)
+            # 列の幅・並びは既存のタブに合わせる
+            source = next((t for t in tabs if window.get_element_by_key(f"-TIMELINE_{t.tab_key}-")), None)
+            if source:
+                self.sync_columns(window[f"-TIMELINE_{source.tab_key}-"].widget, [tab], window)
+            tabs.append(tab)
+            all_tabs.append(tab)
+            if self._app_ref is not None:
+                hashtag_tabs = getattr(self._app_ref, "hashtag_tabs", None)
+                if hashtag_tabs is not None and tag not in hashtag_tabs:
+                    hashtag_tabs.append(tag)
+            self.save_current_ui_state(window, tabs)
+            self._refresh_feed_menu_entries(tabs, all_tabs, window)
+        elif tab not in tabs:
+            # フィードメニューで非表示にしていたタブは表示に戻す
+            self._toggle_tab_visibility(window, tab, tabs, all_tabs)
+
+        notebook.select(window[f"-TAB_{tab.tab_key}-"].widget)
+        window.events.put(("-ASYNC_REFRESH_START-", {"tab_key": tab.tab_key}))
+
+    def _hashtag_history(self):
+        """ハッシュタグの履歴（新しい順のリスト）。アプリ側に無ければ空リスト"""
+        history = getattr(self._app_ref, "hashtag_history", None)
+        return history if history is not None else []
+
+    def _remember_hashtags(self, window, tags, tabs):
+        """タグを履歴の先頭へ入れる（大文字小文字違いは同じタグとして、最後に使った表記で残す）"""
+        history = self._hashtag_history()
+        if self._app_ref is None or not tags:
+            return
+        # 1つのポストに複数あるときは本文の順で並ぶよう、後ろから先頭へ入れる
+        for tag in reversed(tags):
+            history[:] = [t for t in history if t.lower() != tag.lower()]
+            history.insert(0, tag)
+        del history[HASHTAG_HISTORY_MAX:]
+        self.save_current_ui_state(window, tabs)
+
+    def _show_hashtag_menu(self, window, tabs):
+        """入力欄の「#」ボタン: 履歴から選んでカーソル位置に入れるメニュー"""
+        history = self._hashtag_history()
+        button = window["-INLINE_POST_HASHTAG-"].widget
+        menu = tk.Menu(window.window, tearoff=0)
+        if not history:
+            menu.add_command(label="（履歴はまだありません）", state="disabled")
+            menu.add_command(label="ハッシュタグを付けて投稿するか、詳細ペインのタグを開くと増えます", state="disabled")
+        else:
+            for tag in history:
+                menu.add_command(label=f"#{tag}", command=lambda t=tag: self._insert_hashtag(window, t))
+            menu.add_separator()
+            remove_menu = tk.Menu(menu, tearoff=0)
+            for tag in history:
+                remove_menu.add_command(label=f"#{tag}", command=lambda t=tag: self._forget_hashtag(window, t, tabs))
+            remove_menu.add_separator()
+            remove_menu.add_command(label="すべて消去…", command=lambda: self._forget_hashtag(window, None, tabs))
+            menu.add_cascade(label="履歴から削除", menu=remove_menu)
+        menu.tk_popup(button.winfo_rootx(), button.winfo_rooty() + button.winfo_height())
+
+    def _forget_hashtag(self, window, tag, tabs):
+        """履歴からタグを消す。tag=None なら確認のうえ全部消す"""
+        history = self._hashtag_history()
+        if tag is None:
+            if not messagebox.askyesno("ハッシュタグの履歴", "履歴をすべて消去しますか？", default="no", parent=window.window):
+                return
+            history.clear()
+        else:
+            history[:] = [t for t in history if t != tag]
+        self.save_current_ui_state(window, tabs)
+
+    def _insert_hashtag(self, window, tag):
+        """入力欄のカーソル位置に #tag を入れる。前後が文字ならタグとして認識されるよう空白を補う"""
+        widget = window["-INLINE_POST_TEXT-"].widget
+        before = widget.get("insert -1 chars", "insert") if widget.compare("insert", ">", "1.0") else ""
+        after = widget.get("insert", "insert +1 chars")
+        text = f"#{tag}"
+        if before and not before.isspace():
+            text = " " + text
+        if not after or after == "\n" or not after.isspace():
+            text += " "
+        widget.insert("insert", text)
+        widget.focus_set()
+        widget.event_generate("<KeyRelease>")  # 文字数カウンターを更新
+
+    def _close_hashtag_tab(self, window, tab, tabs, all_tabs):
+        """ハッシュタグのタブを閉じる（非表示ではなく削除。再起動後も出てこない）"""
+        try:
+            tab_widget = window[f"-TAB_{tab.tab_key}-"].widget
+            window["-TABGROUP-"].widget.forget(tab_widget)
+            tab_widget.destroy()
+        except Exception:
+            pass
+        for key in (f"-TAB_{tab.tab_key}-", f"-TIMELINE_{tab.tab_key}-"):
+            window.key_elements.pop(key, None)
+        for lst in (tabs, all_tabs):
+            if tab in lst:
+                lst.remove(tab)
+        self._column_reorderers.pop(tab.tab_key, None)
+        self._tree_items.pop(tab.tab_key, None)
+        self._loaded_tabs.discard(tab.tab_key)
+        if self._app_ref is not None:
+            if tab.hashtag in getattr(self._app_ref, "hashtag_tabs", []):
+                self._app_ref.hashtag_tabs.remove(tab.hashtag)
+            getattr(self._app_ref, "hidden_tabs", set()).discard(tab.tab_key)
+        self.save_current_ui_state(window, tabs)
+        self._refresh_feed_menu_entries(tabs, all_tabs, window)
+
+
+    def _embed_post_box(self, text_widget, body, meta, border_color, header=False):
+        """詳細ペインの本文の後ろに、別ポスト（返信元・引用元）を枠付きで埋め込む
+
+        header=True なら meta（投稿者・日時）を本文の上に、False なら下に置く。
+        """
+        bg_color = text_widget.cget("bg")
+        fg_color = text_widget.cget("fg")
+        frame = tk.Frame(text_widget, highlightbackground=border_color, highlightthickness=1, bg=bg_color)
+
+        meta_label = tk.Label(frame, text=meta, justify="left", bg=bg_color, fg="gray", font=(self.font_family, self.font_size - 1))
+        body_label = tk.Label(frame, text=body or "", justify="left", anchor="nw", bg=bg_color, fg=fg_color, font=(self.font_family, self.font_size))
+        if header:
+            meta_label.pack(anchor="w", padx=5, pady=(5, 0))
+            body_label.pack(fill="x", expand=True, padx=5, pady=(0, 5))
+        else:
+            body_label.pack(fill="x", expand=True, padx=5, pady=(5, 0))
+            meta_label.pack(anchor="w", padx=5, pady=(0, 5))
+
+        text_widget.window_create(tk.END, window=frame, padx=10, pady=5)
+
+        if not hasattr(text_widget, "_embedded_frames"):
+            text_widget._embedded_frames = []
+            def _on_resize(e):
+                for f, lbl in text_widget._embedded_frames:
+                    try:
+                        if f.winfo_exists():
+                            fw = e.width - 35
+                            if fw > 0:
+                                lbl.config(wraplength=fw - 15)
+                    except Exception:
+                        pass
+            text_widget.bind("<Configure>", _on_resize, add="+")
+
+        text_widget._embedded_frames = [(f, l) for f, l in text_widget._embedded_frames if f.winfo_exists()]
+        text_widget._embedded_frames.append((frame, body_label))
+
+        text_widget.after(10, lambda bl=body_label, tw=text_widget: bl.config(wraplength=max(100, tw.winfo_width() - 50)))
+
+    def _image_index_text(self, post, idx):
+        """画像欄の上に出す「n / m」等の表示"""
+        n = len(post.thumbnail_urls)
+        prefix = "❝ 引用元の" if post.media_from_quote else ""
+        if post.is_video:
+            return f"🎬 {prefix}動画 (ダブルクリックで再生ページを開く)"
+        if n > 1:
+            return f"{prefix}画像 {idx + 1} / {n}" if prefix else f"{idx + 1} / {n}"
+        return f"{prefix}画像" if prefix else ""
 
     def _load_detail_images(self, window, post):
         """詳細ペインのアバターとプレビュー画像を反映する。
@@ -701,13 +896,8 @@ class MainWindow:
         pane_elem = window["-DETAIL_PANED-"]
 
         if post.thumbnail_urls:
-            # Update index display
             # 動画は静止画のサムネイルしか出せないため、再生手段を添えて示す
-            if post.is_video:
-                idx_text = "🎬 動画 (ダブルクリックで再生ページを開く)"
-            else:
-                idx_text = f"1 / {len(post.thumbnail_urls)}" if len(post.thumbnail_urls) > 1 else ""
-            idx_elem.update(idx_text)
+            idx_elem.update(self._image_index_text(post, 0))
 
             # Show image area if hidden
             pane_elem.set_pane2_visible(True)
@@ -1012,34 +1202,37 @@ class MainWindow:
         # Note: In-place modification of the shared 'tabs' list works here
         # since BlueskyApp holds a reference to the same list.
 
+    def _make_tab_element(self, tab):
+        """タイムライン 1 タブぶんの eg.Tab（中に一覧の CustomTable）を作る"""
+        tab_name = tab.name
+        if any(not p.is_read for p in tab.posts):
+            tab_name = "● " + tab_name
+
+        list_items = [self.format_post_for_list(p) for p in tab.posts]
+        if not list_items:
+            list_items = [["（投稿なし）", "", "更新してください", "", 0, 0]]
+
+        # Use default character-based widths for constructor
+        current_col_widths = [13, 12, 40, 19, 6, 6]
+
+        tab_layout = [
+            [CustomTable(
+                values=list_items,
+                headings=TIMELINE_HEADINGS,
+                col_widths=current_col_widths,
+                key=f"-TIMELINE_{tab.tab_key}-",
+                expand_x=True,
+                expand_y=True,
+                pad=(0, 0)
+            )]
+        ]
+        return eg.Tab(tab_name, tab_layout, key=f"-TAB_{tab.tab_key}-", pad=(0, 0))
+
     def show_main(self, tabs: list):
         tab_layouts = []
-        headings = ["名前", "返信先", "本文", "日時", "RT", "いいね"]
-        
+
         for i, tab in enumerate(tabs):
-            tab_name = tab.name
-            if any(not p.is_read for p in tab.posts):
-                tab_name = "● " + tab_name
-            
-            list_items = [self.format_post_for_list(p) for p in tab.posts]
-            if not list_items:
-                list_items = [["（投稿なし）", "", "更新してください", "", 0, 0]]
-
-            # Use default character-based widths for constructor
-            current_col_widths = [13, 12, 40, 19, 6, 6]
-
-            tab_layout = [
-                [CustomTable(
-                    values=list_items, 
-                    headings=headings, 
-                    col_widths=current_col_widths,
-                    key=f"-TIMELINE_{tab.tab_key}-", 
-                    expand_x=True, 
-                    expand_y=True,
-                    pad=(0, 0)
-                )]
-            ]
-            tab_layouts.append(eg.Tab(tab_name, tab_layout, key=f"-TAB_{tab.tab_key}-", pad=(0, 0)))
+            tab_layouts.append(self._make_tab_element(tab))
         # Keep a record of all tabs that have widgets in this session (includes later-hidden ones)
         all_tabs_in_session = list(tabs)
 
@@ -1106,9 +1299,14 @@ class MainWindow:
                                     layout2=[[
                                         eg.Frame(" 新規ポスト ", [
                                             [
+                                                eg.Text("", key="-INLINE_REPLY_INFO-", font=("sans-serif", 9), text_color="blue", expand_x=True),
+                                                eg.Button("返信をやめる", key="-INLINE_REPLY_CANCEL-", font=("sans-serif", 8))
+                                            ],
+                                            [
                                                 eg.Multiline("", size=(60, 2), key="-INLINE_POST_TEXT-", expand_x=True, enable_events=True),
                                                 eg.Column([
-                                                    [eg.Button("📁", key="-INLINE_POST_ADD_IMAGE-", size=(4, 1))],
+                                                    [eg.Button("📁", key="-INLINE_POST_ADD_IMAGE-", size=(4, 1)),
+                                                     eg.Button("#", key="-INLINE_POST_HASHTAG-", size=(3, 1))],
                                                     [eg.Button("ポスト", key="-INLINE_POST_BTN-", size=(8, 1))]
                                                 ], vertical_alignment="top")
                                             ],
@@ -1121,7 +1319,7 @@ class MainWindow:
                                                 ], text_align="right", expand_x=True),
                                                 eg.Text("0/300", key="-INLINE_POST_CHAR_COUNT-", font=("sans-serif", 9), text_color="gray")
                                             ]
-                                        ], expand_x=True, expand_y=False)
+                                        ], key="-INLINE_POST_FRAME-", expand_x=True, expand_y=False)
                                     ]],
                                     key="-LEFT_COLUMN_PANED-",
                                     orient="vertical",
@@ -1204,6 +1402,7 @@ class MainWindow:
         # Hide initial logic
         window["-DETAIL_PANED-"].set_pane2_visible(False)
         _set_elem_visible(window["-INLINE_POST_CLEAR_IMAGE-"], False)
+        self._show_reply_row(window, False)
         for i in range(4):
             _set_elem_visible(window[f"-INLINE_POST_SLOT_{i}-"], False)
         
@@ -1332,6 +1531,13 @@ class MainWindow:
         try:
             widget = window["-INLINE_POST_TEXT-"].widget
             bind_accel(widget, "Return", submit_inline)
+
+            # 返信・引用モード中の Esc で通常のポストに戻す
+            def cancel_reply(e):
+                if self.reply_target or self.quote_target:
+                    window.events.put(("-INLINE_REPLY_CANCEL-", {}))
+                    return "break"
+            widget.bind("<Escape>", cancel_reply)
             
             # クリップボードからの貼り付け (Ctrl+V)
             def handle_paste(e):
@@ -1434,7 +1640,7 @@ class MainWindow:
         self._update_ui_fonts(window)
         
         # FINAL HARD FIX for Treeview (Ensure icons visible, no tree-padding)
-        for tab in tabs:
+        def _fix_tree_layout(tab):
             elem = window[f"-TIMELINE_{tab.tab_key}-"]
             if elem and hasattr(elem, "_tree"):
                 tree = elem._tree
@@ -1450,6 +1656,9 @@ class MainWindow:
                     if tab_frame:
                         tab_frame.pack_configure(padx=0, pady=0)
                 except Exception: pass
+
+        for tab in tabs:
+            _fix_tree_layout(tab)
         
         # Bind image configure for auto-resize
         def _on_image_configure(e):
@@ -1473,9 +1682,17 @@ class MainWindow:
         window.window.bind("<KeyPress>", _on_space_key_press, add="+")
         window.window.bind("<KeyRelease>", _on_space_key_release, add="+")
 
+        # Ctrl+R: 選択中のポストに返信
+        def _on_reply_key(e):
+            if self.current_selected_post:
+                window.events.put(("-ACTION_REPLY-", {"post": self.current_selected_post}))
+            return "break"
+        bind_accel(window.window, "r", _on_reply_key)
+
         # Bind double-click, right-click and column-reorder events
         self._column_reorderers = {}  # tab_key -> ColumnReorderer
-        for tab in tabs:
+
+        def _setup_timeline_table(tab):
             table_elem = window[f"-TIMELINE_{tab.tab_key}-"]
             if table_elem:
                 table_elem.widget.bind("<Double-Button-1>", lambda e: window.dispatch_event("-TABLE_DOUBLE_CLICK-"))
@@ -1509,6 +1726,26 @@ class MainWindow:
                 
                 bind_right_click(table_elem.widget, make_rc_handler(tab))
 
+                # Delete: 選択中の自分のポストを削除（確認ダイアログ付き）
+                def make_delete_handler(t):
+                    def on_delete(e, _tab=t):
+                        tree = window[f"-TIMELINE_{_tab.tab_key}-"].widget
+                        sel = tree.selection()
+                        if not sel:
+                            return "break"
+                        try:
+                            post = _tab.posts[list(tree.get_children()).index(sel[0])]
+                        except (ValueError, IndexError):
+                            return "break"
+                        if self._app_ref and hasattr(self._app_ref, "is_own_post") and self._app_ref.is_own_post(post):
+                            window.events.put(("-ACTION_DELETE-", {"post": post}))
+                        else:
+                            window["-STATUS_BAR-"].update(" 削除できるのは自分のポストだけです")
+                        return "break"
+                    return on_delete
+
+                table_elem.widget.bind("<Delete>", make_delete_handler(tab))
+
                 def make_select_handler(tab_key=tab.tab_key):
                     def handler(e):
                         # スペース操作中の選択変更は _jump_to_next_unread が詳細ペインまで面倒を見る。
@@ -1519,6 +1756,15 @@ class MainWindow:
                         window.dispatch_event(f"-TIMELINE_{tab_key}-")
                     return handler
                 table_elem.widget.bind("<<TreeviewSelect>>", make_select_handler())
+
+        for tab in tabs:
+            _setup_timeline_table(tab)
+
+        # 後からタブを足したときに、起動時と同じ見た目調整とバインドをする
+        def _setup_added_tab(tab):
+            _fix_tree_layout(tab)
+            _setup_timeline_table(tab)
+        self._setup_added_tab = _setup_added_tab
         
         image_elem = window["-IMAGE-"]
         if image_elem:
@@ -1537,24 +1783,56 @@ class MainWindow:
 
         text_widget = window["-DETAIL_TEXT-"].widget
         text_widget.tag_configure("url", foreground="blue", underline=True)
-        
-        def on_url_click(event):
-            try:
-                index = text_widget.index(f"@{event.x},{event.y}")
-                tags = text_widget.tag_names(index)
-                if "url" in tags:
-                    ranges = text_widget.tag_ranges("url")
-                    for i in range(0, len(ranges), 2):
-                        if text_widget.compare(ranges[i], "<=", index) and text_widget.compare(index, "<=", ranges[i+1]):
-                            url = text_widget.get(ranges[i], ranges[i+1])
-                            open_url_safely(url)
-                            break
-            except Exception as e:
-                pass; # print(f"URL click error: {e}")
+        text_widget.tag_configure("mention", foreground="#7b3fbf")
+        text_widget.tag_configure("hashtag", foreground="#c25a00")
 
-        text_widget.tag_bind("url", "<Button-1>", on_url_click)
-        text_widget.tag_bind("url", "<Enter>", lambda e: text_widget.config(cursor="hand2"))
-        text_widget.tag_bind("url", "<Leave>", lambda e: text_widget.config(cursor=""))
+        def _facet_at(event):
+            """マウス位置のリンク・メンション・タグ (種類, 値)。無ければ None"""
+            index = text_widget.index(f"@{event.x},{event.y}")
+            for name in text_widget.tag_names(index):
+                target = getattr(self, "_detail_facets", {}).get(name)
+                if target:
+                    return target
+            return None
+
+        def on_facet_click(event):
+            try:
+                target = _facet_at(event)
+                if target:
+                    self._open_facet(window, *target)
+            except Exception:
+                pass
+
+        # 省略表示のリンクでも行き先が分かるよう、ポイント中はステータスバーに出す
+        hover = {"saved": None}
+
+        def on_facet_enter(event):
+            text_widget.config(cursor="hand2")
+            try:
+                target = _facet_at(event)
+                if target:
+                    kind, value = target
+                    label = {"link": "🔗 ", "mention": "👤 プロフィールを開く: ", "tag": "# タグのタブを開く: #"}[kind]
+                    status = window["-STATUS_BAR-"]
+                    if hover["saved"] is None:
+                        hover["saved"] = status.widget.cget("text")
+                    status.update(f" {label}{value}")
+            except Exception:
+                pass
+
+        def on_facet_leave(event):
+            text_widget.config(cursor="")
+            if hover["saved"] is not None:
+                try:
+                    window["-STATUS_BAR-"].update(hover["saved"])
+                except Exception:
+                    pass
+                hover["saved"] = None
+
+        for tag in FACET_TAGS.values():
+            text_widget.tag_bind(tag, "<Button-1>", on_facet_click)
+            text_widget.tag_bind(tag, "<Enter>", on_facet_enter)
+            text_widget.tag_bind(tag, "<Leave>", on_facet_leave)
 
         # Bind right-click on tabs
         tab_group = window["-TABGROUP-"]
@@ -1843,6 +2121,10 @@ class MainWindow:
                                 if target_tab.tab_type == "feed":
                                     menu.add_command(label="フィードを削除", command=lambda t=target_tab: hide_tab(t))
                                     menu.add_separator()
+                                elif target_tab.tab_type == "hashtag":
+                                    menu.add_command(label="タブを閉じる",
+                                                     command=lambda t=target_tab: self._close_hashtag_tab(window, t, tabs, all_tabs_in_session))
+                                    menu.add_separator()
                                 
                                 menu.add_command(label="（サウンドなし）", command=lambda t=target_tab: set_sound(t, None))
                                 menu.add_separator()
@@ -1985,8 +2267,7 @@ class MainWindow:
                     n = len(self.current_selected_post.thumbnail_urls)
                     self.current_image_idx = (self.current_image_idx + direction) % n
                     new_idx = self.current_image_idx
-                    idx_text = f"{new_idx + 1} / {n}"
-                    window["-IMAGE_INDEX-"].update(idx_text)
+                    window["-IMAGE_INDEX-"].update(self._image_index_text(self.current_selected_post, new_idx))
                     url = self.current_selected_post.thumbnail_urls[new_idx]
                     cached = self._cache_get(url)
                     if cached is not None:
@@ -2062,14 +2343,51 @@ class MainWindow:
 
                 self.apply_unread_tags(window, updated_tabs)
                 self._start_avatar_downloads(window, tabs_to_update)
-            elif event == "-ACTION_REPOST-":
+            elif event == "-ACTION_REPLY-":
+                post = values.get("post")
+                if post and post.can_reply:
+                    self._set_reply_target(window, post)
+                elif post:
+                    reason = "返信できない設定のポストです" if post.is_post else "いいね・リポスト等の通知です"
+                    window["-STATUS_BAR-"].update(f" このポストには返信できません（{reason}）")
+            elif event == "-ACTION_QUOTE-":
+                post = values.get("post")
+                if post and post.can_quote:
+                    self._set_quote_target(window, post)
+                elif post:
+                    reason = "引用できない設定のポストです" if post.is_post else "いいね・リポスト等の通知です"
+                    window["-STATUS_BAR-"].update(f" このポストは引用できません（{reason}）")
+            elif event == "-INLINE_REPLY_CANCEL-":
+                self._clear_composer_mode(window)
+            elif event == "-ACTION_DELETE-":
                 post = values.get("post")
                 if post and hasattr(self, "_app_ref") and self._app_ref:
-                    threading.Thread(target=self._do_action_async, args=(window, "リポスト", self._app_ref.handle_repost, post), daemon=True).start()
-            elif event == "-ACTION_LIKE-":
+                    import tkinter.messagebox as _mb
+                    if _mb.askyesno(
+                        "ポストを削除",
+                        f"このポストを削除しますか？\n\n{_snippet(post.text, 80)}\n\n削除したポストは元に戻せません。",
+                        icon="warning", default="no", parent=window.window,
+                    ):
+                        threading.Thread(target=self._do_delete_async, args=(window, post), daemon=True).start()
+            elif event == "-OPEN_HASHTAG_TAB-":
+                tag = (values or {}).get("tag")
+                if tag:
+                    self._open_hashtag_tab(window, tag, tabs, all_tabs_in_session)
+                    self._remember_hashtags(window, [tag], tabs)
+            elif event == "-HASHTAGS_USED-":
+                self._remember_hashtags(window, (values or {}).get("tags", []), tabs)
+            elif event == "-INLINE_POST_HASHTAG-":
+                self._show_hashtag_menu(window, tabs)
+            elif event == "-POST_DELETED-":
+                self._remove_post_from_tabs(window, values.get("post"), tabs, all_tabs_in_session)
+            elif event in ("-ACTION_REPOST-", "-ACTION_LIKE-"):
                 post = values.get("post")
-                if post and hasattr(self, "_app_ref") and self._app_ref:
-                    threading.Thread(target=self._do_action_async, args=(window, "お気に入り", self._app_ref.handle_like, post), daemon=True).start()
+                kind = "repost" if event == "-ACTION_REPOST-" else "like"
+                if post and hasattr(self, "_app_ref") and self._app_ref and (kind, post.uri) not in self._toggles_in_flight:
+                    self._toggles_in_flight.add((kind, post.uri))
+                    threading.Thread(target=self._do_toggle_async, args=(window, kind, post), daemon=True).start()
+            elif event == "-POST_STATE_CHANGED-":
+                self._sync_post_state(window, values.get("post"), all_tabs_in_session)
             elif event == "-ACTION_FOLLOW-":
                 author = values.get("author")
                 if author and hasattr(self, "_app_ref") and self._app_ref:
@@ -2098,14 +2416,18 @@ class MainWindow:
                 
                 status_elem = window["-STATUS_BAR-"]
                 if success:
-                    if action == "ポスト":
+                    if action in COMPOSER_ACTIONS:
                         try:
                             window["-INLINE_POST_TEXT-"].update("")
                             window["-INLINE_POST_CHAR_COUNT-"].update("0/300", text_color="gray")
                         except Exception: pass
+                    if action in ("返信", "引用"):
+                        self._clear_composer_mode(window)
                     if status_elem:
                         status_elem.update(f" 成功: {action}")
-                        window.window.after(5000, lambda: status_elem.update(" 準備完了") if status_elem.widget.cget("text") == f" 成功: {action}" else None)
+                        # action は既定引数で固定する（ループ変数のままだと、5秒の間に別の操作をすると
+                        # その操作の「成功」表示を消してしまう）
+                        window.window.after(5000, lambda a=action: status_elem.update(" 準備完了") if status_elem.widget.cget("text") == f" 成功: {a}" else None)
                 else:
                     if status_elem:
                         status_elem.update(f" エラー ({action}): {error}")
@@ -2167,6 +2489,11 @@ class MainWindow:
                 # Use current state of images which now includes alt text
                 images = self.inline_post_images
                 video = self.inline_post_video
+                # 「新規ポスト」ダイアログからの投稿は返信・引用モードに関係なく通常のポストにする
+                plain = data_dict.get("-PLAIN_POST-")
+                reply = None if plain else self.reply_target
+                quote = None if plain else self.quote_target
+                action_name = "返信" if reply else "引用" if quote else "ポスト"
                 if text and text.strip():
                     if len(text.strip()) > 300:
                         import tkinter.messagebox as _mb
@@ -2178,7 +2505,8 @@ class MainWindow:
 
                         threading.Thread(
                             target=self._do_action_async,
-                            args=(window, "ポスト", self.post_callback, text.strip(), images, video, on_video_progress),
+                            args=(window, action_name, self.post_callback, text.strip(), images, video, on_video_progress,
+                                  reply.uri if reply else None, quote.uri if quote else None),
                             daemon=True
                         ).start()
             elif event == "-VIDEO_PROGRESS-":
@@ -2298,14 +2626,180 @@ class MainWindow:
     def _do_action_async(self, window, action_name, func, *args):
         try:
             success, err = func(*args)
-            if success and action_name == "ポスト":
+            if success and action_name in COMPOSER_ACTIONS:
                 window.window.after(100, lambda: self._reset_inline_post_images(window))
-            elif action_name == "ポスト":
+                # 投稿した本文のハッシュタグを履歴へ（保存は Tk を触るのでメインスレッドで）
+                tags = [s.value for s in richtext.detect(args[0]) if s.kind == "tag"] if args else []
+                if tags:
+                    window.events.put(("-HASHTAGS_USED-", {"tags": tags}))
+            elif action_name in COMPOSER_ACTIONS:
                 # 失敗時は添付を残し、動画の進捗表示だけ元に戻す
                 window.window.after(100, lambda: self._update_image_status(window, "-INLINE_POST_"))
             window.events.put(("-ACTION_COMPLETE-", {"action": action_name, "success": success, "error": err}))
         except Exception as e:
             window.events.put(("-ACTION_COMPLETE-", {"action": action_name, "success": False, "error": str(e)}))
+
+    def _do_delete_async(self, window, post):
+        try:
+            success, err = self._app_ref.handle_delete(post)
+        except Exception as e:
+            success, err = False, str(e)
+        if success:
+            window.events.put(("-POST_DELETED-", {"post": post}))
+        window.events.put(("-ACTION_COMPLETE-", {"action": "削除", "success": success, "error": err}))
+
+    def _remove_post_from_tabs(self, window, post, tabs, all_tabs):
+        """削除したポストを全タブから取り除いて一覧を描き直す
+
+        すぐ再取得しても AppView への反映待ちで削除前の内容が返ることがあるため、手元で消す。
+        """
+        if not post:
+            return
+        uri = post.uri
+        changed = []
+        for t in all_tabs:
+            remaining = [p for p in t.posts if p.uri != uri]
+            if len(remaining) != len(t.posts):
+                t.posts = remaining
+                changed.append(t)
+
+        for t in changed:
+            list_items = [self.format_post_for_list(p) for p in t.posts]
+            if not list_items:
+                list_items = [["(No posts yet)", "", "Click Refresh", "", 0, 0]]
+            table_elem = window[f"-TIMELINE_{t.tab_key}-"]
+            if table_elem:
+                table_elem.update(values=list_items)
+                self._refresh_tree_items(window, t.tab_key)
+        if changed:
+            self.apply_unread_tags(window, tabs)
+            self._start_avatar_downloads(window, changed)
+
+        if self.reply_target and self.reply_target.uri == uri:
+            self._set_reply_target(window, None)
+        if self.quote_target and self.quote_target.uri == uri:
+            self._set_quote_target(window, None)
+        if self.current_selected_post and self.current_selected_post.uri == uri:
+            # 詳細ペインは残すが、削除済みのポストへ返信・削除などができないよう選択を外す
+            self.current_selected_post = None
+            try:
+                window["-DETAIL_DATE-"].update(f"{post.created_at}（削除済み）")
+            except Exception:
+                pass
+
+    def _show_reply_row(self, window, visible):
+        """新規ポスト枠の先頭にある「返信先」行を出し入れする
+
+        中身だけ pack_forget すると空の行フレームが高さを持ったまま残るので、行ごと外す。
+        再表示時は元の位置（本文入力行の前）へ差し込む。
+        """
+        try:
+            row = window["-INLINE_REPLY_INFO-"].widget.master
+            parent = row.master
+            if visible:
+                if not row.winfo_manager():
+                    opts = {"side": "top", "fill": "x"}
+                    if self._reply_row_next is not None:
+                        opts["before"] = self._reply_row_next
+                    row.pack(**opts)
+            elif row.winfo_manager():
+                slaves = parent.pack_slaves()
+                idx = slaves.index(row)
+                self._reply_row_next = slaves[idx + 1] if idx + 1 < len(slaves) else None
+                row.pack_forget()
+        except Exception:
+            pass
+
+    def _set_reply_target(self, window, post):
+        """インライン入力欄を post への返信モードにする。post=None で返信をやめる"""
+        self.reply_target = post
+        self._refresh_composer_mode(window, focus=bool(post))
+
+    def _set_quote_target(self, window, post):
+        """インライン入力欄を post の引用モードにする。post=None で引用をやめる"""
+        self.quote_target = post
+        self._refresh_composer_mode(window, focus=bool(post))
+
+    def _clear_composer_mode(self, window):
+        self.reply_target = None
+        self.quote_target = None
+        self._refresh_composer_mode(window)
+
+    def _refresh_composer_mode(self, window, focus=False):
+        """返信先・引用元の表示行、枠の見出し、ボタンの文言を今のモードに合わせる"""
+        reply, quote = self.reply_target, self.quote_target
+        lines = []
+        if reply:
+            lines.append(f"↩ {reply.author_display_name} (@{reply.author_handle}) に返信: {_snippet(reply.text, 40)}")
+        if quote:
+            lines.append(f"❝ {quote.author_display_name} (@{quote.author_handle}) を引用: {_snippet(quote.text, 40)}")
+        if reply and quote:
+            title, cancel = " 返信（引用付き） ", "返信・引用をやめる"
+        elif reply:
+            title, cancel = " 返信 ", "返信をやめる"
+        elif quote:
+            title, cancel = " 引用ポスト ", "引用をやめる"
+        else:
+            title, cancel = " 新規ポスト ", "返信をやめる"
+        try:
+            window["-INLINE_REPLY_INFO-"].update("\n".join(lines))
+            self._show_reply_row(window, bool(lines))
+            window["-INLINE_REPLY_CANCEL-"].widget.configure(text=cancel)
+            window["-INLINE_POST_BTN-"].widget.configure(text="返信" if reply else "ポスト")
+            window["-INLINE_POST_FRAME-"].widget.configure(text=title)
+            if focus:
+                window["-INLINE_POST_TEXT-"].widget.focus_set()
+        except Exception:
+            pass
+
+    def _do_toggle_async(self, window, kind, post):
+        """お気に入り / リポストの付け外し（今の状態の逆にする）"""
+        if kind == "like":
+            action = "お気に入り解除" if post.viewer_like_uri else "お気に入り"
+            func = self._app_ref.handle_like
+        else:
+            action = "リポスト取り消し" if post.viewer_repost_uri else "リポスト"
+            func = self._app_ref.handle_repost
+        try:
+            success, err = func(post)
+        except Exception as e:
+            success, err = False, str(e)
+        finally:
+            self._toggles_in_flight.discard((kind, post.uri))
+        if success:
+            window.events.put(("-POST_STATE_CHANGED-", {"post": post}))
+        window.events.put(("-ACTION_COMPLETE-", {"action": action, "success": success, "error": err}))
+
+    def _sync_post_state(self, window, post, all_tabs):
+        """お気に入り・リポストの状態と件数を、同じポストを表示している全タブの行と詳細ペインに反映する"""
+        if not post:
+            return
+        for t in all_tabs:
+            table_elem = window[f"-TIMELINE_{t.tab_key}-"]
+            items = None
+            for idx, p in enumerate(t.posts):
+                if p.uri != post.uri:
+                    continue
+                if p is not post:
+                    p.viewer_like_uri = post.viewer_like_uri
+                    p.viewer_repost_uri = post.viewer_repost_uri
+                    p.like_count = post.like_count
+                    p.repost_count = post.repost_count
+                if table_elem and table_elem.widget:
+                    if items is None:
+                        items = self._get_tree_items(table_elem.widget, t.tab_key)
+                    if idx < len(items):
+                        try:
+                            table_elem.widget.item(items[idx], values=self.format_post_for_list(p))
+                        except Exception:
+                            pass
+        cur = self.current_selected_post
+        if cur and cur.uri == post.uri:
+            try:
+                window["-DETAIL_REPOST-"].update(f"🔁 {cur.repost_count}")
+                window["-DETAIL_LIKE-"].update(f"❤ {cur.like_count}")
+            except Exception:
+                pass
 
     def _reset_inline_post_images(self, window):
         self.inline_post_images = []
@@ -2334,8 +2828,15 @@ class MainWindow:
     def _show_context_menu(self, window, post, x_root, y_root):
         import tkinter as tk
         menu = tk.Menu(window.window, tearoff=0)
-        menu.add_command(label="リポスト", command=lambda: window.dispatch_event("-ACTION_REPOST-", {"post": post}))
-        menu.add_command(label="お気に入り", command=lambda: window.dispatch_event("-ACTION_LIKE-", {"post": post}))
+        menu.add_command(label="返信 (Ctrl+R)", command=lambda: window.dispatch_event("-ACTION_REPLY-", {"post": post}),
+                         state="normal" if post.can_reply else "disabled")
+        menu.add_command(label="引用", command=lambda: window.dispatch_event("-ACTION_QUOTE-", {"post": post}),
+                         state="normal" if post.can_quote else "disabled")
+        menu.add_separator()
+        menu.add_command(label="リポスト取り消し" if post.viewer_repost_uri else "リポスト",
+                         command=lambda: window.dispatch_event("-ACTION_REPOST-", {"post": post}))
+        menu.add_command(label="お気に入り解除" if post.viewer_like_uri else "お気に入り",
+                         command=lambda: window.dispatch_event("-ACTION_LIKE-", {"post": post}))
         
         # Check if already bookmarked
         is_bookmarked = False
@@ -2349,6 +2850,10 @@ class MainWindow:
         menu.add_command(label="プロフィールを表示", command=lambda: window.dispatch_event("-ACTION_SHOW_PROFILE-", {"author": post.author_handle}))
         menu.add_command(label=f"@{post.author_handle} をフォロー", command=lambda: window.dispatch_event("-ACTION_FOLLOW-", {"author": post.author_handle}))
         menu.add_command(label=f"@{post.author_handle} のフォロー解除", command=lambda: window.dispatch_event("-ACTION_UNFOLLOW-", {"author": post.author_handle}))
+
+        if self._app_ref and hasattr(self._app_ref, "is_own_post") and self._app_ref.is_own_post(post):
+            menu.add_separator()
+            menu.add_command(label="ポストを削除… (Delete)", command=lambda: window.dispatch_event("-ACTION_DELETE-", {"post": post}))
         menu.tk_popup(x_root, y_root)
 
     def save_current_ui_state(self, window, tabs):
@@ -2444,6 +2949,8 @@ class MainWindow:
                 state["read_post_uris"] = list(self._app_ref.read_post_uris)
                 state["bookmarked_uris"] = list(getattr(self._app_ref, "bookmarked_uris", []))
                 state["hidden_tabs"] = list(getattr(self._app_ref, "hidden_tabs", []))
+                state["hashtag_tabs"] = list(getattr(self._app_ref, "hashtag_tabs", []))
+                state["hashtag_history"] = list(getattr(self._app_ref, "hashtag_history", []))
             elif hasattr(self, "app_ref") and self.app_ref:
                 state["read_post_uris"] = list(self.app_ref.read_post_uris)
                 state["bookmarked_uris"] = list(getattr(self.app_ref, "bookmarked_uris", []))
@@ -2800,7 +3307,7 @@ class MainWindow:
                     # 投稿はインライン側のハンドラが処理するため、添付もそちらへ引き渡す
                     self.inline_post_images = self._dialog_images
                     self.inline_post_video = self._dialog_video
-                    parent_window.events.put(("-INLINE_POST_BTN-", {"-INLINE_POST_TEXT-": text.strip()}))
+                    parent_window.events.put(("-INLINE_POST_BTN-", {"-INLINE_POST_TEXT-": text.strip(), "-PLAIN_POST-": True}))
                 break
         
         window.close()

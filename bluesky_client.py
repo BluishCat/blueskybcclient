@@ -31,6 +31,15 @@ from utils import credentials
 from utils.paths import get_resource_path, get_app_dir
 from ui.main_window import MainWindow
 
+class _PostOnlyFeedView:
+    """PostView を Post.from_feed_view に渡すための入れ物（検索結果などリポスト情報の無いもの）"""
+    reason = None
+    reply = None
+
+    def __init__(self, post):
+        self.post = post
+
+
 class BlueskyApp:
     def __init__(self):
         self.api = BlueskyClientWrapper()
@@ -42,6 +51,10 @@ class BlueskyApp:
         self.read_post_uris = set(self.ui_state.get("read_post_uris", []))
         self.bookmarked_uris = set(self.ui_state.get("bookmarked_uris", []))
         self.hidden_tabs = set(self.ui_state.get("hidden_tabs", []))
+        # ハッシュタグをクリックして開いたタブ（タグの一覧。再起動後も開いたままにする）
+        self.hashtag_tabs = list(self.ui_state.get("hashtag_tabs", []))
+        # 投稿したタグ・クリックして開いたタグの履歴（新しい順）。入力欄の「#」ボタンから選べる
+        self.hashtag_history = list(self.ui_state.get("hashtag_history", []))
         
         self.ui = MainWindow(
             login_callback=self.handle_login,
@@ -53,10 +66,11 @@ class BlueskyApp:
     def handle_login(self, username, password):
         return self.api.login(username, password)
 
-    def handle_post(self, text, images=None, video=None, on_progress=None):
+    def handle_post(self, text, images=None, video=None, on_progress=None, reply_to_uri=None, quote_uri=None):
+        """ポストを送信する。reply_to_uri で返信、quote_uri で引用になる（併用可）"""
         # Bluesky は画像と動画を同時に添付できないため、動画があれば動画として扱う
         if video:
-            return self._post_video(text, video, on_progress)
+            return self._post_video(text, video, on_progress, reply_to_uri, quote_uri)
         if images:
             images_bytes = []
             image_alts = []
@@ -73,10 +87,11 @@ class BlueskyApp:
                     image_alts.append(alt)
                 except Exception as e:
                     pass; # print(f"Failed to load image: {e}")
-            return self.api.send_post_with_images(text, images_bytes, image_alts=image_alts)
-        return self.api.send_post(text)
+            return self.api.send_post_with_images(text, images_bytes, image_alts=image_alts,
+                                                  reply_to_uri=reply_to_uri, quote_uri=quote_uri)
+        return self.api.send_post(text, reply_to_uri=reply_to_uri, quote_uri=quote_uri)
 
-    def _post_video(self, text, video, on_progress):
+    def _post_video(self, text, video, on_progress, reply_to_uri=None, quote_uri=None):
         """動画添付ポスト。video は UI が組み立てた {"path", "info", "alt"}"""
         path = video["path"]
         with open(path, "rb") as f:
@@ -93,13 +108,51 @@ class BlueskyApp:
             alt=video["alt"],
             aspect_ratio=aspect_ratio,
             on_progress=on_progress,
+            reply_to_uri=reply_to_uri,
+            quote_uri=quote_uri,
         )
 
     def handle_repost(self, post):
-        return self.api.repost_post(post.uri, post.cid)
+        """リポストしていなければリポスト、していれば取り消す。成功したら post の状態も更新する"""
+        if post.viewer_repost_uri:
+            success, err = self.api.unrepost_post(post.viewer_repost_uri)
+            if success:
+                post.viewer_repost_uri = None
+                post.repost_count = max(0, post.repost_count - 1)
+        else:
+            success, err, repost_uri = self.api.repost_post(post.uri, post.cid)
+            if success:
+                post.viewer_repost_uri = repost_uri
+                post.repost_count += 1
+        return success, err
+
+    def is_own_post(self, post):
+        """ログイン中のアカウントのポストか（ハンドル変更に左右されないよう URI の DID で見る）"""
+        did = self.api.did
+        return bool(did and post.is_post and post.uri.startswith(f"at://{did}/"))
+
+    def handle_delete(self, post):
+        if not self.is_own_post(post):
+            return False, "自分のポストではないため削除できません"
+        success, err = self.api.delete_post(post.uri)
+        if success:
+            self.bookmarked_uris.discard(post.uri)
+            self.read_post_uris.discard(post.uri)
+        return success, err
 
     def handle_like(self, post):
-        return self.api.like_post(post.uri, post.cid)
+        """お気に入りしていなければお気に入り、していれば取り消す。成功したら post の状態も更新する"""
+        if post.viewer_like_uri:
+            success, err = self.api.unlike_post(post.viewer_like_uri)
+            if success:
+                post.viewer_like_uri = None
+                post.like_count = max(0, post.like_count - 1)
+        else:
+            success, err, like_uri = self.api.like_post(post.uri, post.cid)
+            if success:
+                post.viewer_like_uri = like_uri
+                post.like_count += 1
+        return success, err
 
     def handle_follow(self, author_handle):
         return self.api.follow_user(author_handle)
@@ -144,6 +197,11 @@ class BlueskyApp:
                     for item in feed:
                         try:
                             posts.append(Post.from_feed_view(item))
+                        except Exception: pass
+                elif tab.tab_type == "hashtag":
+                    for p_view in self.api.search_hashtag(tab.hashtag, limit=30):
+                        try:
+                            posts.append(Post.from_feed_view(_PostOnlyFeedView(p_view)))
                         except Exception: pass
                 elif tab.tab_type == "bookmarks":
                     if self.bookmarked_uris:
@@ -203,6 +261,10 @@ class BlueskyApp:
         pinned = self.api.get_pinned_feeds()
         for f in pinned:
             unsorted_tabs.append(TimelineTabModel(f["name"], "feed", f["uri"]))
+
+        # ハッシュタグのタブ
+        for tag in self.hashtag_tabs:
+            unsorted_tabs.append(TimelineTabModel.for_hashtag(tag))
             
         # Sort based on saved order if available
         saved_order = self.ui_state.get("tab_order", [])
