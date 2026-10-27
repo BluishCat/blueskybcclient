@@ -17,6 +17,7 @@ from utils.mp4 import read_video_info
 from utils.version import __version__
 from utils.platform_compat import bind_accel, bind_right_click, hook_dropfiles
 from utils import richtext
+from utils import updater
 from models.tab import TimelineTabModel
 
 # ウィンドウタイトルの共通部分。ログイン後の統計付きタイトルも同じ前半を使う
@@ -2088,6 +2089,10 @@ class MainWindow:
         if interval_min > 0:
             self._auto_refresh_timer = window.window.after(interval_min * 60 * 1000, _do_auto_refresh)
 
+        # 起動時の更新確認（タイムラインの初回読み込みと重ならないよう少し遅らせる）
+        if self.ui_settings.get("auto_update_check", True):
+            window.window.after(5000, lambda: self._start_update_check(window, manual=False))
+
         while True:
             event, values = window.read()
             if event in (None, "Exit"):
@@ -2559,6 +2564,28 @@ class MainWindow:
                 return "Logout"
             elif event == "Options":
                 self.show_settings_dialog(window, tabs)
+            elif event == "Check Update":
+                self._start_update_check(window, manual=True)
+            elif event == "About":
+                self._show_about_dialog(window)
+            elif event == "-UPDATE_CHECK_RESULT-":
+                data = values if isinstance(values, dict) else {}
+                if self._on_update_check_result(window, tabs, data):
+                    self._start_update_download(window, data.get("info") or {})
+            elif event == "-UPDATE_PROGRESS-":
+                data = values if isinstance(values, dict) else {}
+                self._update_progress_dialog(data.get("done", 0), data.get("total", 0))
+            elif event == "-UPDATE_FAILED-":
+                data = values if isinstance(values, dict) else {}
+                self._close_progress_dialog()
+                self._update_busy = False
+                messagebox.showerror("更新", data.get("error") or "更新に失敗しました。", parent=window.window)
+            elif event == "-UPDATE_DOWNLOADED-":
+                data = values if isinstance(values, dict) else {}
+                if self._finish_update(window, data):
+                    self.save_current_ui_state(window, tabs)
+                    window.close()
+                    return "Restart"
 
     def _build_menubar(self, window, tabs, all_tabs):
         """Build a full custom menubar with a dynamic feed visibility menu."""
@@ -2596,6 +2623,13 @@ class MainWindow:
         settings_menu = tk.Menu(menubar, tearoff=0)
         settings_menu.add_command(label="オプション", command=lambda: window.dispatch_event("Options"))
         menubar.add_cascade(label="設定", menu=settings_menu)
+
+        # ---- ヘルプ ----
+        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="更新の確認",     command=lambda: window.dispatch_event("Check Update"))
+        help_menu.add_separator()
+        help_menu.add_command(label="バージョン情報", command=lambda: window.dispatch_event("About"))
+        menubar.add_cascade(label="ヘルプ", menu=help_menu)
 
         root.config(menu=menubar)
 
@@ -2974,6 +3008,9 @@ class MainWindow:
             state["font_family"] = self.font_family
             state["font_size"] = self.font_size
             state["auto_refresh"] = self.ui_settings.get("auto_refresh", 0)
+            state["auto_update_check"] = self.ui_settings.get("auto_update_check", True)
+            if self.ui_settings.get("skipped_update_version"):
+                state["skipped_update_version"] = self.ui_settings["skipped_update_version"]
             
             # Read Posts and Hidden Tabs
             if hasattr(self, "_app_ref") and self._app_ref:
@@ -3366,6 +3403,7 @@ class MainWindow:
             [eg.Text("フォント名:"), eg.Combo(families, default_value=self.font_family, key="-FONT_FAMILY-", expand_x=True)],
             [eg.Text("サイズ:"), eg.Combo(sizes, default_value=self.font_size, key="-FONT_SIZE-", readonly=True)],
             [eg.Text("タイムライン自動更新(分):"), eg.Combo(list(refresh_options.keys()), default_value=current_refresh_str, key="-AUTO_REFRESH-", readonly=True)],
+            [eg.Checkbox("起動時に新しいバージョンを確認する", default=bool(self.ui_settings.get("auto_update_check", True)), key="-AUTO_UPDATE_CHECK-")],
             [eg.Button("保存", key="-SAVE_SETTINGS-"), eg.Button("キャンセル")]
         ]
         
@@ -3392,6 +3430,8 @@ class MainWindow:
             
             if "-AUTO_REFRESH-" in values:
                 self.ui_settings["auto_refresh"] = refresh_options[values["-AUTO_REFRESH-"]]
+            if "-AUTO_UPDATE_CHECK-" in values:
+                self.ui_settings["auto_update_check"] = bool(values["-AUTO_UPDATE_CHECK-"])
             
             # Save settings
             self.save_current_ui_state(parent_window, tabs)
@@ -3402,6 +3442,197 @@ class MainWindow:
             self._update_ui_fonts(parent_window)
             import tkinter.messagebox as _mb
             _mb.showinfo("設定", "設定を保存しました。", parent=parent_window.window)
+
+    # ---------------- 更新の確認・自己更新 ----------------
+
+    def _start_update_check(self, window, manual):
+        """GitHub の最新リリースをバックグラウンドで確認する。結果は -UPDATE_CHECK_RESULT- で届く。"""
+        if getattr(self, "_update_busy", False):
+            if manual:
+                messagebox.showinfo("更新の確認", "更新の確認・ダウンロードを実行中です。", parent=window.window)
+            return
+        self._update_busy = True
+
+        def worker():
+            try:
+                info = updater.fetch_latest_release()
+                window.events.put(("-UPDATE_CHECK_RESULT-", {"manual": manual, "info": info}))
+            except Exception as e:
+                window.events.put(("-UPDATE_CHECK_RESULT-", {"manual": manual, "error": str(e)}))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_update_check_result(self, window, tabs, data):
+        """確認結果を表示する。ダウンロードへ進むなら True を返す（_update_busy は維持）。"""
+        manual = data.get("manual", False)
+        info = data.get("info")
+        if not info:
+            self._update_busy = False
+            if manual:
+                messagebox.showerror("更新の確認", data.get("error") or "更新を確認できませんでした。", parent=window.window)
+            return False
+
+        latest = info.get("version") or ""
+        if not updater.is_newer(latest):
+            self._update_busy = False
+            if manual:
+                messagebox.showinfo("更新の確認", f"お使いのバージョン (v{__version__}) は最新です。", parent=window.window)
+            return False
+
+        # 自動確認では「このバージョンをスキップ」したものは通知しない
+        if not manual and self.ui_settings.get("skipped_update_version") == latest:
+            self._update_busy = False
+            return False
+
+        choice = self._show_update_dialog(window, info, manual)
+        if choice == "update":
+            return True
+        self._update_busy = False
+        if choice == "skip":
+            self.ui_settings["skipped_update_version"] = latest
+            self.save_current_ui_state(window, tabs)
+        elif choice == "page":
+            open_url_safely(info.get("html_url") or updater.RELEASES_PAGE)
+        return False
+
+    def _show_update_dialog(self, window, info, manual):
+        """新しいバージョンの案内。戻り値: "update" / "page" / "skip" / None(後で)"""
+        can_update = updater.can_self_update() and bool(info.get("asset_url")) and bool(info.get("sha256"))
+        size_mb = (info.get("asset_size") or 0) / (1000 * 1000)
+        lines = [f"新しいバージョン v{info.get('version')} が公開されています。（現在: v{__version__}）"]
+        if can_update:
+            lines.append(f"「今すぐ更新」でダウンロード（約 {size_mb:.0f} MB）して置き換え、再起動します。")
+            lines.append("設定・ログイン情報・サウンドはそのまま引き継がれます。")
+        elif not updater.can_self_update():
+            lines.append("ソースから実行しているため自動更新はできません。git pull などで更新してください。")
+        else:
+            lines.append("このリリースは自動更新に対応していません。リリースページから更新してください。")
+
+        buttons = []
+        if can_update:
+            buttons.append(eg.Button("今すぐ更新", key="-UPD_NOW-"))
+        buttons.append(eg.Button("リリースページを開く", key="-UPD_PAGE-"))
+        if not manual:
+            buttons.append(eg.Button("このバージョンをスキップ", key="-UPD_SKIP-"))
+        buttons.append(eg.Button("後で", key="-UPD_LATER-"))
+
+        layout = [
+            [eg.Text("\n".join(lines))],
+            [eg.Frame("変更内容", [[eg.Multiline(info.get("body") or "(リリースノートはありません)",
+                                                size=(70, 14), readonly=True, expand_x=True, expand_y=True,
+                                                font=(self.font_family, self.font_size))]],
+                      expand_x=True, expand_y=True)],
+            buttons,
+        ]
+        location = None
+        try:
+            location = (window.window.winfo_x() + 60, window.window.winfo_y() + 60)
+        except Exception:
+            pass
+        dlg = eg.Window("更新があります", layout, modal=True, location=location, resizable=True)
+        event, _ = dlg.read()
+        dlg.close()
+        return {"-UPD_NOW-": "update", "-UPD_PAGE-": "page", "-UPD_SKIP-": "skip"}.get(event)
+
+    def _start_update_download(self, window, info):
+        self._open_progress_dialog(window, info.get("version") or "")
+        last = {"pct": -1}
+
+        def on_progress(done, total):
+            pct = int(done * 100 / total) if total else -1
+            if pct != last["pct"]:
+                last["pct"] = pct
+                window.events.put(("-UPDATE_PROGRESS-", {"done": done, "total": total}))
+
+        def worker():
+            try:
+                path = updater.download_update(info, on_progress=on_progress)
+                window.events.put(("-UPDATE_DOWNLOADED-", {"path": path, "version": info.get("version")}))
+            except Exception as e:
+                window.events.put(("-UPDATE_FAILED-", {"error": str(e)}))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _open_progress_dialog(self, window, version):
+        self._close_progress_dialog()
+        top = tk.Toplevel(window.window)
+        top.title("更新")
+        top.transient(window.window)
+        top.resizable(False, False)
+        top.protocol("WM_DELETE_WINDOW", lambda: None)  # ダウンロード中は閉じさせない
+        ttk.Label(top, text=f"v{version} をダウンロードしています…").pack(padx=16, pady=(14, 6), anchor="w")
+        bar = ttk.Progressbar(top, length=320, mode="determinate", maximum=100)
+        bar.pack(padx=16, pady=4)
+        label = ttk.Label(top, text="")
+        label.pack(padx=16, pady=(2, 14), anchor="w")
+        try:
+            top.update_idletasks()
+            x = window.window.winfo_x() + (window.window.winfo_width() - top.winfo_width()) // 2
+            y = window.window.winfo_y() + (window.window.winfo_height() - top.winfo_height()) // 2
+            top.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        except Exception:
+            pass
+        self._progress_dialog = (top, bar, label)
+
+    def _update_progress_dialog(self, done, total):
+        dlg = getattr(self, "_progress_dialog", None)
+        if not dlg:
+            return
+        top, bar, label = dlg
+        try:
+            if total:
+                bar.configure(mode="determinate", value=done * 100 / total)
+                label.configure(text=f"{done / 1e6:.1f} / {total / 1e6:.1f} MB")
+            else:
+                label.configure(text=f"{done / 1e6:.1f} MB")
+        except tk.TclError:
+            pass
+
+    def _close_progress_dialog(self):
+        dlg = getattr(self, "_progress_dialog", None)
+        self._progress_dialog = None
+        if dlg:
+            try:
+                dlg[0].destroy()
+            except tk.TclError:
+                pass
+
+    def _finish_update(self, window, data):
+        """ダウンロード済みの exe に置き換える。今すぐ再起動するなら True。"""
+        self._close_progress_dialog()
+        self._update_busy = False
+        try:
+            updater.apply_update(data.get("path"))
+        except Exception as e:
+            messagebox.showerror("更新", str(e), parent=window.window)
+            return False
+
+        msg = f"v{data.get('version')} に更新しました。今すぐ再起動しますか？\n「いいえ」を選ぶと、次回の起動から新しいバージョンになります。"
+        try:
+            draft = window["-INLINE_POST_TEXT-"].get().strip()
+        except Exception:
+            draft = ""
+        if draft:
+            msg += "\n\n※入力中のポストは破棄されます。"
+        return messagebox.askyesno("更新", msg, parent=window.window)
+
+    def _show_about_dialog(self, window):
+        layout = [
+            [eg.Text(f"Poisora v{__version__}", font=(self.font_family, self.font_size + 4, "bold"))],
+            [eg.Text("Bluesky クライアント")],
+            [eg.Text(f"https://github.com/{updater.REPO}")],
+            [eg.Button("GitHub を開く", key="-ABOUT_GITHUB-"), eg.Button("閉じる", key="-ABOUT_CLOSE-")],
+        ]
+        location = None
+        try:
+            location = (window.window.winfo_x() + 60, window.window.winfo_y() + 60)
+        except Exception:
+            pass
+        dlg = eg.Window("バージョン情報", layout, modal=True, location=location)
+        event, _ = dlg.read()
+        dlg.close()
+        if event == "-ABOUT_GITHUB-":
+            open_url_safely(f"https://github.com/{updater.REPO}")
 
     def _update_ui_fonts(self, window):
         # Update detail view fonts and other text/multiline elements
