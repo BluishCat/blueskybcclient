@@ -1,6 +1,7 @@
 import TkEasyGUI as eg
 import io
 import os
+import sys
 import uuid
 import tkinter as tk
 from tkinter import ttk, font as tkfont, filedialog, messagebox
@@ -470,6 +471,7 @@ class MainWindow:
         self._detail_render_timer = None  # 長押し通過後に詳細ペインを本描画する after() のID
         self._space_held = False  # スペースが物理的に押されているか（KeyPress/KeyReleaseで更新）
         self._space_repeat_timer = None  # 長押し中の連続ジャンプ after() のID
+        self._space_press_seq = 0  # 押下ごとに増やす番号。古い押下が張ったタイマーを見分ける
         self._loaded_tabs = set() # tab_keys that have been refreshed at least once
         self._tree_items = {} # tab_key -> tuple(item_id): 直近描画時の行ID一覧（get_children 呼び出し削減用）
         
@@ -990,6 +992,23 @@ class MainWindow:
             focused.delete(0, "end")
         return False
 
+    def _space_key_down(self):
+        """スペースが物理的に押されているか。Windows では OS に直接問い合わせ、
+        KeyRelease の取りこぼし（フォーカス移動など）で長押しが止まらなくなるのを防ぐ。
+        それ以外の OS では KeyRelease を信じる。"""
+        if sys.platform != "win32":
+            return True
+        try:
+            import ctypes
+            return bool(ctypes.windll.user32.GetAsyncKeyState(0x20) & 0x8000)  # VK_SPACE
+        except Exception:
+            return True
+
+    def _cancel_space_repeat(self, window):
+        if self._space_repeat_timer:
+            window.window.after_cancel(self._space_repeat_timer)
+            self._space_repeat_timer = None
+
     def _on_space_press(self, window, tabs):
         """スペース押下。単押しぶんを即座に送り、押し続けられたら連続送りに入る。
         オートリピートのKeyPressは押下状態で弾くので、送り速度はタイマーだけが決める。"""
@@ -998,28 +1017,40 @@ class MainWindow:
         if self._is_space_input_blocked(window):
             return
         self._space_held = True
-        # 単押しはここで完結するので詳細ペインも画像もその場で描く
+        self._space_press_seq += 1
+        seq = self._space_press_seq
+        self._cancel_space_repeat(window)
+        # 単押しはここで完結するので詳細ペインも画像もその場で描く。
+        # 画像描画は update() を回すため、この中で次の解放・押下が処理されることがある（再入）。
         self._jump_to_next_unread(window, tabs, fast_pass=False)
+        # 再入で解放済み、または次の押下に引き継がれていたら長押しタイマーは張らない。
+        # 張ると解放で取り消されない孤児タイマーになり、次の押下中に発火して余分に1つ進む。
+        if not self._space_held or seq != self._space_press_seq:
+            return
         self._space_repeat_timer = window.window.after(
-            SPACE_REPEAT_DELAY_MS, lambda: self._space_repeat_tick(window, tabs)
+            SPACE_REPEAT_DELAY_MS, lambda: self._space_repeat_tick(window, tabs, seq)
         )
 
-    def _space_repeat_tick(self, window, tabs):
+    def _space_repeat_tick(self, window, tabs, seq):
         """長押し中の1送り。通過中は既読化だけに絞り、押されている間だけ自分を張り直す。"""
-        if not self._space_held:
-            self._space_repeat_timer = None
+        self._space_repeat_timer = None
+        if not self._space_held or seq != self._space_press_seq:
+            return
+        if not self._space_key_down():
+            # KeyRelease を取りこぼしている。解放として扱い、押下状態を残さない
+            self._on_space_release(window)
             return
         self._jump_to_next_unread(window, tabs, fast_pass=True)
+        if not self._space_held or seq != self._space_press_seq:
+            return
         self._space_repeat_timer = window.window.after(
-            SPACE_REPEAT_INTERVAL_MS, lambda: self._space_repeat_tick(window, tabs)
+            SPACE_REPEAT_INTERVAL_MS, lambda: self._space_repeat_tick(window, tabs, seq)
         )
 
     def _on_space_release(self, window):
         """スペース解放。連続送りを即座に止め、通過中に省いた描画をここで反映する。"""
         self._space_held = False
-        if self._space_repeat_timer:
-            window.window.after_cancel(self._space_repeat_timer)
-            self._space_repeat_timer = None
+        self._cancel_space_repeat(window)
         # 保留中＝直前の送りが描画を省いている。settleを待たずここで描く
         if self._detail_render_timer:
             self._cancel_detail_render(window)
