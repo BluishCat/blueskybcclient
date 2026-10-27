@@ -636,44 +636,26 @@ class MainWindow:
         text_widget.delete("1.0", "end")
         
         text_widget.insert(tk.END, post.text + "\n")
-        
+
+        # 引用元（本文のすぐ下）→ 返信元 の順に枠付きで埋め込む
+        if getattr(post, 'quote_author', None):
+            body = post.quote_text or ""
+            if post.media_from_quote:
+                body += ("\n" if body else "") + ("🎬 動画あり" if post.is_video else "🖼 画像・リンクカードは右の画像欄に表示")
+            meta = f"❝ {post.quote_author} (@{post.quote_handle})"
+            if post.quote_created_at:
+                meta += f" {post.quote_created_at}"
+            text_widget.insert(tk.END, "\n")
+            self._embed_post_box(text_widget, body, meta, "steelblue", header=True)
+
         if hasattr(post, 'reply_parent_text') and post.reply_parent_text:
             text_widget.insert(tk.END, "\n\n")
-            
-            bg_color = text_widget.cget("bg")
-            fg_color = text_widget.cget("fg")
-            reply_frame = tk.Frame(text_widget, highlightbackground="pink", highlightthickness=1, bg=bg_color)
-            
-            content = post.reply_parent_text or ""
-            reply_txt = tk.Label(reply_frame, text=content, justify="left", anchor="nw", bg=bg_color, fg=fg_color, font=(self.font_family, self.font_size))
-            reply_txt.pack(fill="x", expand=True, padx=5, pady=(5, 0))
-            
-            meta_text = f"- {post.reply_parent_author} (@{post.reply_parent_handle})"
+            meta = f"- {post.reply_parent_author} (@{post.reply_parent_handle})"
             date_text = getattr(post, 'reply_parent_created_at', '')
-            if date_text: meta_text += f" {date_text}"
-            meta_label = tk.Label(reply_frame, text=meta_text, justify="left", bg=bg_color, fg="gray", font=(self.font_family, self.font_size - 1))
-            meta_label.pack(anchor="w", padx=5, pady=(0, 5))
-            
-            text_widget.window_create(tk.END, window=reply_frame, padx=10, pady=5)
-            
-            if not hasattr(text_widget, "_embedded_frames"):
-                text_widget._embedded_frames = []
-                def _on_resize(e):
-                    for f, lbl in text_widget._embedded_frames:
-                        try:
-                            if f.winfo_exists():
-                                fw = e.width - 35
-                                if fw > 0:
-                                    lbl.config(wraplength=fw - 15)
-                        except Exception:
-                            pass
-                text_widget.bind("<Configure>", _on_resize, add="+")
-            
-            text_widget._embedded_frames = [(f, l) for f, l in text_widget._embedded_frames if f.winfo_exists()]
-            text_widget._embedded_frames.append((reply_frame, reply_txt))
-            
-            text_widget.after(10, lambda rt=reply_txt, tw=text_widget: rt.config(wraplength=max(100, tw.winfo_width() - 50)))
-        
+            if date_text:
+                meta += f" {date_text}"
+            self._embed_post_box(text_widget, post.reply_parent_text, meta, "pink")
+
         import re
         url_pattern = re.compile(r'https?://[^\s]+')
         content = text_widget.get("1.0", "end-1c")
@@ -684,6 +666,54 @@ class MainWindow:
             
         text_widget.config(state="disabled")
 
+
+    def _embed_post_box(self, text_widget, body, meta, border_color, header=False):
+        """詳細ペインの本文の後ろに、別ポスト（返信元・引用元）を枠付きで埋め込む
+
+        header=True なら meta（投稿者・日時）を本文の上に、False なら下に置く。
+        """
+        bg_color = text_widget.cget("bg")
+        fg_color = text_widget.cget("fg")
+        frame = tk.Frame(text_widget, highlightbackground=border_color, highlightthickness=1, bg=bg_color)
+
+        meta_label = tk.Label(frame, text=meta, justify="left", bg=bg_color, fg="gray", font=(self.font_family, self.font_size - 1))
+        body_label = tk.Label(frame, text=body or "", justify="left", anchor="nw", bg=bg_color, fg=fg_color, font=(self.font_family, self.font_size))
+        if header:
+            meta_label.pack(anchor="w", padx=5, pady=(5, 0))
+            body_label.pack(fill="x", expand=True, padx=5, pady=(0, 5))
+        else:
+            body_label.pack(fill="x", expand=True, padx=5, pady=(5, 0))
+            meta_label.pack(anchor="w", padx=5, pady=(0, 5))
+
+        text_widget.window_create(tk.END, window=frame, padx=10, pady=5)
+
+        if not hasattr(text_widget, "_embedded_frames"):
+            text_widget._embedded_frames = []
+            def _on_resize(e):
+                for f, lbl in text_widget._embedded_frames:
+                    try:
+                        if f.winfo_exists():
+                            fw = e.width - 35
+                            if fw > 0:
+                                lbl.config(wraplength=fw - 15)
+                    except Exception:
+                        pass
+            text_widget.bind("<Configure>", _on_resize, add="+")
+
+        text_widget._embedded_frames = [(f, l) for f, l in text_widget._embedded_frames if f.winfo_exists()]
+        text_widget._embedded_frames.append((frame, body_label))
+
+        text_widget.after(10, lambda bl=body_label, tw=text_widget: bl.config(wraplength=max(100, tw.winfo_width() - 50)))
+
+    def _image_index_text(self, post, idx):
+        """画像欄の上に出す「n / m」等の表示"""
+        n = len(post.thumbnail_urls)
+        prefix = "❝ 引用元の" if post.media_from_quote else ""
+        if post.is_video:
+            return f"🎬 {prefix}動画 (ダブルクリックで再生ページを開く)"
+        if n > 1:
+            return f"{prefix}画像 {idx + 1} / {n}" if prefix else f"{idx + 1} / {n}"
+        return f"{prefix}画像" if prefix else ""
 
     def _load_detail_images(self, window, post):
         """詳細ペインのアバターとプレビュー画像を反映する。
@@ -715,13 +745,8 @@ class MainWindow:
         pane_elem = window["-DETAIL_PANED-"]
 
         if post.thumbnail_urls:
-            # Update index display
             # 動画は静止画のサムネイルしか出せないため、再生手段を添えて示す
-            if post.is_video:
-                idx_text = "🎬 動画 (ダブルクリックで再生ページを開く)"
-            else:
-                idx_text = f"1 / {len(post.thumbnail_urls)}" if len(post.thumbnail_urls) > 1 else ""
-            idx_elem.update(idx_text)
+            idx_elem.update(self._image_index_text(post, 0))
 
             # Show image area if hidden
             pane_elem.set_pane2_visible(True)
@@ -2038,8 +2063,7 @@ class MainWindow:
                     n = len(self.current_selected_post.thumbnail_urls)
                     self.current_image_idx = (self.current_image_idx + direction) % n
                     new_idx = self.current_image_idx
-                    idx_text = f"{new_idx + 1} / {n}"
-                    window["-IMAGE_INDEX-"].update(idx_text)
+                    window["-IMAGE_INDEX-"].update(self._image_index_text(self.current_selected_post, new_idx))
                     url = self.current_selected_post.thumbnail_urls[new_idx]
                     cached = self._cache_get(url)
                     if cached is not None:

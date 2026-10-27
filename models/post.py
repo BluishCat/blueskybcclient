@@ -28,8 +28,52 @@ def format_bluesky_date(date_str):
         # パース不能な日時はそのまま返す
         return date_str
 
+def _quoted_view(embed):
+    """埋め込みから引用元ポストのビュー (app.bsky.embed.record#viewRecord) を取り出す。無ければ None
+
+    引用のみ: embed.record が viewRecord
+    引用＋画像など (recordWithMedia): embed.record.record が viewRecord
+    削除済み・ブロック中の引用元（viewNotFound / viewBlocked）やフィード・リストの埋め込みは value が無いので None。
+    """
+    rec = getattr(embed, 'record', None)
+    if rec is None:
+        return None
+    if getattr(rec, 'value', None) is None and getattr(rec, 'record', None) is not None:
+        rec = rec.record
+    value = getattr(rec, 'value', None)
+    if value is None or not hasattr(value, 'text'):
+        return None
+    return rec
+
+
+def _media_urls(media):
+    """添付のビューから (サムネイル URL 群, 拡大表示・リンク先 URL 群, 動画か) を取り出す"""
+    thumbs, fulls = [], []
+    # models.AppBskyEmbedImages.View
+    if getattr(media, 'images', None):
+        for img in media.images:
+            if img.thumb:
+                thumbs.append(img.thumb)
+            if img.fullsize:
+                fulls.append(img.fullsize)
+        return thumbs, fulls, False
+    # 動画 (app.bsky.embed.video#view) の実体は HLS のため再生できない。
+    # サムネイルの静止画だけを表示し、再生はブラウザの投稿ページに任せる
+    if hasattr(media, 'playlist'):
+        if media.thumbnail:
+            thumbs.append(media.thumbnail)
+        return thumbs, fulls, True
+    # リンクカード
+    external = getattr(media, 'external', None)
+    if external is not None and getattr(external, 'thumb', None):
+        thumbs.append(external.thumb)
+        if getattr(external, 'uri', None):
+            fulls.append(external.uri)
+    return thumbs, fulls, False
+
+
 class Post:
-    def __init__(self, author_handle, author_display_name, text, created_at, uri=None, cid=None, reply_to=None, thumbnail_urls=None, full_image_urls=None, repost_count=0, like_count=0, avatar_url=None, reply_parent_author=None, reply_parent_handle=None, reply_parent_text=None, quote_author=None, quote_handle=None, quote_text=None, is_repost=False, reposted_by_author=None, reposted_by_handle=None, is_follower=False, is_video=False, viewer_like_uri=None, viewer_repost_uri=None, reply_disabled=False, embedding_disabled=False):
+    def __init__(self, author_handle, author_display_name, text, created_at, uri=None, cid=None, reply_to=None, thumbnail_urls=None, full_image_urls=None, repost_count=0, like_count=0, avatar_url=None, reply_parent_author=None, reply_parent_handle=None, reply_parent_text=None, quote_author=None, quote_handle=None, quote_text=None, is_repost=False, reposted_by_author=None, reposted_by_handle=None, is_follower=False, is_video=False, media_from_quote=False, quote_created_at=None, viewer_like_uri=None, viewer_repost_uri=None, reply_disabled=False, embedding_disabled=False):
         self.author_handle = author_handle
         self.author_display_name = author_display_name or author_handle
         self.text = text
@@ -53,6 +97,9 @@ class Post:
         self.quote_author = quote_author
         self.quote_handle = quote_handle
         self.quote_text = quote_text
+        self.quote_created_at = format_bluesky_date(quote_created_at) if quote_created_at else ""
+        # thumbnail_urls 等が引用元の添付か（自分の添付が無い引用ポストのとき True）
+        self.media_from_quote = media_from_quote
         self.is_follower = is_follower
         # 自分との関係（ログイン中アカウントのいいね・リポストのレコード URI、返信・引用の可否）
         self.viewer_like_uri = viewer_like_uri
@@ -107,69 +154,38 @@ class Post:
             except Exception:
                 pass
         
-        # Extract thumbnail and full image if any
+        # 添付（画像・動画・リンクカード）と引用元
         thumbnail_urls = []
         full_image_urls = []
         is_video = False
+        media_from_quote = False
         quote_author = None
         quote_handle = None
         quote_text = None
-        if hasattr(post, 'embed') and post.embed:
-            # Extract quote info
-            embed = post.embed
-            if hasattr(embed, 'record'):
-                rec = embed.record
-                if hasattr(rec, 'record'):
-                    view_rec = rec.record
-                    if hasattr(view_rec, 'value') and hasattr(view_rec.value, 'text'):
-                        quote_text = view_rec.value.text
-                    elif hasattr(view_rec, 'text'):
-                        quote_text = view_rec.text
-                    if hasattr(view_rec, 'author'):
-                        quote_handle = view_rec.author.handle
-                        quote_author = view_rec.author.display_name or view_rec.author.handle
-                elif hasattr(rec, 'value'):
-                    if hasattr(rec.value, 'text'):
-                        quote_text = rec.value.text
-                    if hasattr(rec, 'author'):
-                        quote_handle = rec.author.handle
-                        quote_author = getattr(rec.author, 'display_name', '') or rec.author.handle
-            elif hasattr(embed, 'media') and hasattr(embed, 'record'):
-                if hasattr(embed.record, 'record'):
-                    view_rec = embed.record.record
-                    if hasattr(view_rec, 'value') and hasattr(view_rec.value, 'text'):
-                        quote_text = view_rec.value.text
-                    elif hasattr(view_rec, 'text'):
-                        quote_text = view_rec.text
-                    if hasattr(view_rec, 'author'):
-                        quote_handle = view_rec.author.handle
-                        quote_author = view_rec.author.display_name or view_rec.author.handle
+        quote_created_at = None
+        embed = getattr(post, 'embed', None)
+        if embed:
+            quoted = _quoted_view(embed)
+            if quoted is not None:
+                value = getattr(quoted, 'value', None)
+                quote_text = getattr(value, 'text', None) or ''
+                quote_created_at = getattr(value, 'created_at', None)
+                q_author = getattr(quoted, 'author', None)
+                if q_author is not None:
+                    quote_handle = q_author.handle
+                    quote_author = getattr(q_author, 'display_name', '') or q_author.handle
 
             # 引用付き投稿 (recordWithMedia) では画像・動画は embed.media 側にぶら下がる
-            media = getattr(post.embed, 'media', post.embed)
+            thumbnail_urls, full_image_urls, is_video = _media_urls(getattr(embed, 'media', embed))
 
-            # Check for images
-            # models.AppBskyEmbedImages.View
-            if hasattr(media, 'images') and media.images:
-                for img in media.images:
-                    if img.thumb:
-                        thumbnail_urls.append(img.thumb)
-                    if img.fullsize:
-                        full_image_urls.append(img.fullsize)
-            # 動画 (app.bsky.embed.video#view) の実体は HLS のため再生できない。
-            # サムネイルの静止画だけを表示し、再生はブラウザの投稿ページに任せる
-            elif hasattr(media, 'playlist'):
-                is_video = True
-                if media.thumbnail:
-                    thumbnail_urls.append(media.thumbnail)
-            # Check for external (link preview)
-            elif hasattr(media, 'external') and hasattr(media.external, 'thumb'):
-                thumb = media.external.thumb
-                if thumb:
-                    thumbnail_urls.append(thumb)
-                    if hasattr(media.external, 'uri') and media.external.uri:
-                        full_image_urls.append(media.external.uri)
-                
+            # 自分の添付が無い引用ポストは、引用元の画像・動画・リンクカードを見せる
+            if not thumbnail_urls and quoted is not None:
+                for q_embed in getattr(quoted, 'embeds', None) or []:
+                    thumbnail_urls, full_image_urls, is_video = _media_urls(getattr(q_embed, 'media', q_embed))
+                    if thumbnail_urls:
+                        media_from_quote = True
+                        break
+
         avatar_url = getattr(author, 'avatar', None)
         viewer = getattr(post, 'viewer', None)
         return cls(
@@ -194,6 +210,8 @@ class Post:
             quote_author=quote_author,
             quote_handle=quote_handle,
             quote_text=quote_text,
+            quote_created_at=quote_created_at,
+            media_from_quote=media_from_quote,
             is_follower=is_follower,
             is_video=is_video,
             viewer_like_uri=getattr(viewer, 'like', None),
