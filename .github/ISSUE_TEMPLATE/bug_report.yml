@@ -1,0 +1,81 @@
+name: 不具合の報告
+description: 動かない・おかしな表示になる・落ちるなどの問題を報告する
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        報告ありがとうございます。わかる範囲で記入してください（わからない項目は空欄でかまいません）。
+        **パスワードやアプリパスワードは絶対に書かないでください。** スクリーンショットに個人的なポストが写っている場合は、見せたくない部分を隠してから貼ってください。
+
+  - type: input
+    id: version
+    attributes:
+      label: Poisora のバージョン
+      description: メニューの「ヘルプ」＞「バージョン情報」で確認できます。
+      placeholder: 例) v0.6.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      options:
+        - Windows 11
+        - Windows 10
+        - その他（下の「補足」に書いてください）
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 何が起きましたか？
+      description: 実際に起きたことと、本来どうなってほしかったかを書いてください。
+      placeholder: |
+        例) 通知タブを開くとアプリが固まって操作できなくなる。
+        本来は通知の一覧が表示されるはず。
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 再現手順
+      description: どういう操作をすると起きるか、順番に書いてください。
+      placeholder: |
+        1. アプリを起動してログインする
+        2. タイムライン下部の「通知」タブをクリックする
+        3. ...
+    validations:
+      required: false
+
+  - type: dropdown
+    id: frequency
+    attributes:
+      label: 発生頻度
+      options:
+        - 毎回起きる
+        - ときどき起きる
+        - 一度だけ起きた
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: エラーログ
+      description: |
+        `Poisora.exe` と同じフォルダに `crash_log.txt` があれば、中身を貼り付けてください。エラーのダイアログが出た場合はその文面も貼ってください。
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 補足・スクリーンショット
+      description: 画像はここにドラッグ＆ドロップで貼り付けられます。
+    validations:
+      required: false

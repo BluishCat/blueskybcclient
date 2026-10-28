@@ -1,0 +1,13 @@
+body:
+  - type: markdown
+    attributes:
+      value: |
+        「こんな機能があったらいいな」を気軽に書いてください。まとまったら Issue として起票します。
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: アイデア
+      description: どういう場面で、どうなると便利かを書いてください。
+    validations:
+      required: true

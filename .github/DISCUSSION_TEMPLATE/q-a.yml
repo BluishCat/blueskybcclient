@@ -1,0 +1,23 @@
+body:
+  - type: markdown
+    attributes:
+      value: |
+        使い方の質問や「これって不具合？」という確認はこちらへどうぞ。
+        **パスワードやアプリパスワードは絶対に書かないでください。**
+
+  - type: input
+    id: version
+    attributes:
+      label: Poisora のバージョン
+      description: メニューの「ヘルプ」＞「バージョン情報」で確認できます。
+      placeholder: 例) v0.6.0
+    validations:
+      required: false
+
+  - type: textarea
+    id: question
+    attributes:
+      label: 質問内容
+      description: 何をしようとして、どうなったかを書いてください。
+    validations:
+      required: true
