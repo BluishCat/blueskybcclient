@@ -1,0 +1,34 @@
+name: 機能の要望
+description: 「こういう機能がほしい」「ここをこう変えてほしい」という提案
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        要望ありがとうございます。まだアイデアの段階なら、[Discussions のアイデア](https://github.com/BluishCat/poisora/discussions/categories/ideas) で気軽に相談することもできます。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 困っていること・やりたいこと
+      description: どういう場面で、何に困っているか（何をしたいか）を書いてください。
+      placeholder: 例) 複数のリストを行き来するのに毎回タブを探すのが面倒。
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: こうなってほしい
+      description: 具体的な案があれば書いてください。
+      placeholder: 例) Ctrl+1〜9 でタブを切り替えられるようにしてほしい。
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 参考（他のクライアントの例など）
+      description: 他のアプリで似た機能を見かけたら、名前やスクリーンショットがあると助かります。
+    validations:
+      required: false

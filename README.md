@@ -97,6 +97,16 @@ Blueskyのデスクトップ向けクライアントアプリケーションで�
 
 ---
 
+## 不具合の報告・要望・質問
+
+*   **不具合の報告・機能の要望:** [GitHub Issues](https://github.com/BluishCat/poisora/issues/new/choose) から、用意されたフォームに沿って書いてください。バージョン（「ヘルプ」＞「バージョン情報」）と、`Poisora.exe` と同じフォルダに `crash_log.txt` があればその中身を添えてもらえると、原因を調べやすくなります。
+*   **使い方の質問・アイデアの相談:** [GitHub Discussions](https://github.com/BluishCat/poisora/discussions) で気軽にどうぞ。
+*   **更新情報:** 新しいバージョンは [Releases](https://github.com/BluishCat/poisora/releases) で公開しています（アプリ起動時にも自動で通知されます）。
+
+※ パスワードやアプリパスワードは、報告や質問に絶対に書かないでください。
+
+---
+
 ## アンインストール
 
 本アプリケーションはレジストリ等を使用していません。

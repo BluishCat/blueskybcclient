@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 質問・使い方の相談
+    url: https://github.com/BluishCat/poisora/discussions/categories/q-a
+    about: 使い方がわからない、これは不具合なのか確認したい、といったときはこちら
+  - name: アイデア・雑談
+    url: https://github.com/BluishCat/poisora/discussions
+    about: 要望の相談や、ちょっとした感想はこちら
